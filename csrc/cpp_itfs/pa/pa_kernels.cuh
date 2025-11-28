@@ -4,6 +4,7 @@
 
 template <typename scalar_t,
           typename cache_t,
+          typename query_t,  // Added: can be scalar_t (bf16/fp16) or uint8_t (FP8)
           vllm::Fp8KVCacheDataType KV_DTYPE,
           int BLOCK_SIZE,
           int HEAD_SIZE,
@@ -12,13 +13,14 @@ template <typename scalar_t,
           int GQA_RATIO,
           int MTP,
           typename AttentionVariant,
-          bool SLIDING_WINDOW_ENABLED>
+          bool SLIDING_WINDOW_ENABLED,
+          bool Q_PRE_QUANTIZED = false>  // Added: whether Q is pre-quantized to FP8
 __inline__ __device__ void
 _paged_attention_kernel(const int* block_table_seq,
                         const int64_t query_loc,
                         int context_len,
                         const int partition_start_token_idx,
-                        const scalar_t* q,
+                        const query_t* q,  // Changed: can be FP8 when pre-quantized
                         const cache_t* k_cache,
                         const cache_t* v_cache,
                         const float scale,
@@ -134,40 +136,64 @@ _paged_attention_kernel(const int* block_table_seq,
     {
         for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
         {
-            const scalar_t* q_ptr =
+            const query_t* q_ptr =
                 q + (query_start_off + mtp * MTP_PARALLEL_THREADS) * q_stride +
                 (global_qhead_idx + gqa_ratio_loop * GQA_RATIO_PER_LOOP) * HEAD_SIZE;
 
             for(int head_loop = 0; head_loop < HEAD_LOOP; head_loop++)
             {
+                // For pre-quantized FP8 Q, we load half as many bytes (8 bytes vs 16 bytes)
+                constexpr int Q_ELEMS_PER_16B = Q_PRE_QUANTIZED ? 16 : CONTIGUOUS_SCALAR_ELEMS_16B;
                 const int qhead_element =
-                    lane16id * CONTIGUOUS_SCALAR_ELEMS_16B + head_loop * HEAD_SIZE_PER_LOOP;
+                    lane16id * Q_ELEMS_PER_16B + head_loop * HEAD_SIZE_PER_LOOP;
                 if((local_mtp_qhead_idx < GQA_RATIO_MTP_PARALLEL) && (qhead_element < HEAD_SIZE))
                 {
-                    const scalar_t* q_fetch_ptr   = q_ptr + qhead_element;
-                    const _B16x8* q_fetch_ptr_16B = reinterpret_cast<const _B16x8*>(q_fetch_ptr);
-                    _B16x8 tmp                    = *q_fetch_ptr_16B;
-
-                    if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kAuto)
+                    if constexpr(Q_PRE_QUANTIZED)
                     {
-                        const int offset1 =
-                            lane16id /
-                            4; // 16 contiguous chunks of head elems are spread across 4x4lanes
-                        shared_logits[gqa_ratio_loop][head_loop][mtp][offset1][lane4id]
-                                     [local_qhead_idx][0] = tmp.xy[0];
-                        shared_logits[gqa_ratio_loop][head_loop][mtp][offset1][lane4id]
-                                     [local_qhead_idx][1] = tmp.xy[1];
-                    }
-                    else
-                    {
+                        // Q is already FP8 - load 16 bytes = 16 FP8 elements
+                        const uint8_t* q_fetch_ptr = reinterpret_cast<const uint8_t*>(q_ptr) + qhead_element;
+                        const _B16x8* q_fetch_ptr_16B = reinterpret_cast<const _B16x8*>(q_fetch_ptr);
+                        _B16x8 tmp = *q_fetch_ptr_16B;
+                        
+                        // Store directly for FP8 MFMA layout
                         for(int i = 0; i < 2; i++)
                         {
-                            const int head_elem = lane16id * 2 + i; // element id in _B16x4 terms
+                            const int head_elem = lane16id * 2 + i;
                             const int offset3   = head_elem % 4;
                             const int offset2   = (head_elem / 4) % 4;
                             const int offset1   = head_elem / 4 / 4;
                             shared_logits[gqa_ratio_loop][head_loop][mtp][offset1][offset2]
                                          [local_qhead_idx][offset3] = tmp.xy[i];
+                        }
+                    }
+                    else
+                    {
+                        // Original bf16/fp16 Q path
+                        const scalar_t* q_fetch_ptr   = reinterpret_cast<const scalar_t*>(q_ptr) + qhead_element;
+                        const _B16x8* q_fetch_ptr_16B = reinterpret_cast<const _B16x8*>(q_fetch_ptr);
+                        _B16x8 tmp                    = *q_fetch_ptr_16B;
+
+                        if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kAuto)
+                        {
+                            const int offset1 =
+                                lane16id /
+                                4; // 16 contiguous chunks of head elems are spread across 4x4lanes
+                            shared_logits[gqa_ratio_loop][head_loop][mtp][offset1][lane4id]
+                                         [local_qhead_idx][0] = tmp.xy[0];
+                            shared_logits[gqa_ratio_loop][head_loop][mtp][offset1][lane4id]
+                                         [local_qhead_idx][1] = tmp.xy[1];
+                        }
+                        else
+                        {
+                            for(int i = 0; i < 2; i++)
+                            {
+                                const int head_elem = lane16id * 2 + i; // element id in _B16x4 terms
+                                const int offset3   = head_elem % 4;
+                                const int offset2   = (head_elem / 4) % 4;
+                                const int offset1   = head_elem / 4 / 4;
+                                shared_logits[gqa_ratio_loop][head_loop][mtp][offset1][offset2]
+                                             [local_qhead_idx][offset3] = tmp.xy[i];
+                            }
                         }
                     }
                 }
@@ -384,22 +410,33 @@ _paged_attention_kernel(const int* block_table_seq,
                                 _T8x8 Ktmp8x8, Qtmp8x8;
                                 Ktmp8x8.b8x8 = Ktmp8x16.xy[qkratio];
 
-                                for(int i = 0; i < 2; i++)
+                                if constexpr(Q_PRE_QUANTIZED)
                                 {
-                                    scalar_t* qptr = reinterpret_cast<scalar_t*>(
-                                        &Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth][qkratio]
-                                             .xy[i]);
+                                    // Q is already FP8 - use directly without conversion
+                                    uint8_t* qptr_fp8 = reinterpret_cast<uint8_t*>(
+                                        &Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth][qkratio]);
+                                    Qtmp8x8.b8x8 = *reinterpret_cast<_B8x8*>(qptr_fp8);
+                                }
+                                else
+                                {
+                                    // Convert bf16/fp16 Q to FP8 on-the-fly
+                                    for(int i = 0; i < 2; i++)
+                                    {
+                                        scalar_t* qptr = reinterpret_cast<scalar_t*>(
+                                            &Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth][qkratio]
+                                                 .xy[i]);
 
-                                    Qtmp8x8.b16x4[i * 2] = __builtin_amdgcn_cvt_pk_fp8_f32(
-                                        to_float<scalar_t>(qptr[0]) * q_scale,
-                                        to_float<scalar_t>(qptr[1]) * q_scale,
-                                        0,
-                                        false);
-                                    Qtmp8x8.b16x4[i * 2 + 1] = __builtin_amdgcn_cvt_pk_fp8_f32(
-                                        to_float<scalar_t>(qptr[2]) * q_scale,
-                                        to_float<scalar_t>(qptr[3]) * q_scale,
-                                        0,
-                                        false);
+                                        Qtmp8x8.b16x4[i * 2] = __builtin_amdgcn_cvt_pk_fp8_f32(
+                                            to_float<scalar_t>(qptr[0]) * q_scale,
+                                            to_float<scalar_t>(qptr[1]) * q_scale,
+                                            0,
+                                            false);
+                                        Qtmp8x8.b16x4[i * 2 + 1] = __builtin_amdgcn_cvt_pk_fp8_f32(
+                                            to_float<scalar_t>(qptr[2]) * q_scale,
+                                            to_float<scalar_t>(qptr[3]) * q_scale,
+                                            0,
+                                            false);
+                                    }
                                 }
 
                                 d_out[gqa_ratio_loop][mtp][token_depth] =

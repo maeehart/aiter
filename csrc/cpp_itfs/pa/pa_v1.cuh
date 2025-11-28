@@ -27,6 +27,7 @@
 
 template <typename scalar_t,
           typename cache_t,
+          typename query_t,  // Added: can be scalar_t (bf16/fp16) or uint8_t (FP8)
           vllm::Fp8KVCacheDataType KV_DTYPE,
           int BLOCK_SIZE,
           int HEAD_SIZE,
@@ -35,9 +36,10 @@ template <typename scalar_t,
           int GQA_RATIO,
           int MTP,
           typename AttentionVariant,
-          bool SLIDING_WINDOW_ENABLED>
+          bool SLIDING_WINDOW_ENABLED,
+          bool Q_PRE_QUANTIZED = false>  // Added: whether Q is pre-quantized to FP8
 __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
-    const scalar_t* __restrict__ q,      // [num_seqs, num_heads, head_size]
+    const query_t* __restrict__ q,      // [num_seqs, num_heads, head_size] - can be FP8 when pre-quantized
     const cache_t* __restrict__ k_cache, // [num_blocks, block_size, num_kv_heads,
                                          // head_size]
     const cache_t* __restrict__ v_cache, // [num_blocks, block_size, num_kv_heads,
@@ -84,7 +86,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
         return;
     }
     const int* block_table_seq = block_tables + seq_idx * max_num_blocks_per_seq;
-    _paged_attention_kernel<scalar_t, cache_t, KV_DTYPE, BLOCK_SIZE, HEAD_SIZE, NUM_THREADS, ALIBI_ENABLED, GQA_RATIO, MTP, AttentionVariant, SLIDING_WINDOW_ENABLED>(block_table_seq, static_cast<int64_t>(query_loc), context_len, partition_start_token_idx, q, k_cache, v_cache, scale, alibi_slopes, q_stride, kv_block_stride, kv_head_stride, kv_seq_stride, exp_sums, max_logits, out, logits_soft_cap, logits_soft_cap_rcp, q_scale_ptr, k_scale_ptr, v_scale_ptr, variant, sliding_window);    
+    _paged_attention_kernel<scalar_t, cache_t, query_t, KV_DTYPE, BLOCK_SIZE, HEAD_SIZE, NUM_THREADS, ALIBI_ENABLED, GQA_RATIO, MTP, AttentionVariant, SLIDING_WINDOW_ENABLED, Q_PRE_QUANTIZED>(block_table_seq, static_cast<int64_t>(query_loc), context_len, partition_start_token_idx, q, k_cache, v_cache, scale, alibi_slopes, q_stride, kv_block_stride, kv_head_stride, kv_seq_stride, exp_sums, max_logits, out, logits_soft_cap, logits_soft_cap_rcp, q_scale_ptr, k_scale_ptr, v_scale_ptr, variant, sliding_window);    
 }
 
 // Grid: (num_heads, num_seqs).
@@ -128,6 +130,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kern
 
 template <typename scalar_t,
           typename cache_t,
+          typename query_t,
           vllm::Fp8KVCacheDataType KV_DTYPE,
           int BLOCK_SIZE,
           int HEAD_SIZE,
@@ -136,9 +139,10 @@ template <typename scalar_t,
           int GQA_RATIO,
           int MTP,
           typename AttentionVariant,
-          bool SLIDING_WINDOW_ENABLED>
+          bool SLIDING_WINDOW_ENABLED,
+          bool Q_PRE_QUANTIZED = false>
 __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
-    const scalar_t* __restrict__ q,      // [num_seqs, num_heads, head_size]
+    const query_t* __restrict__ q,      // [num_seqs, num_heads, head_size]
     const cache_t* __restrict__ k_cache, // [num_blocks, num_kv_heads,
                                          // head_size/x, block_size, x]
     const cache_t* __restrict__ v_cache, // [num_blocks, num_kv_heads,

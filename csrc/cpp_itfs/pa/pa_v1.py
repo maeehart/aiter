@@ -23,6 +23,7 @@ def compile(
     partition_size: int = 256,
     mtp: int = 1,
     sliding_window_enabled: bool = False,
+    q_pre_quantized: bool = False,  # Added: whether Q is pre-quantized to FP8
     folder: str = None,
 ):
     return compile_template_op(
@@ -49,6 +50,7 @@ def compile(
         partition_size=partition_size,
         mtp=mtp,
         sliding_window_enabled=sliding_window_enabled,
+        q_pre_quantized=q_pre_quantized,
         folder=folder,
     )
 
@@ -75,13 +77,23 @@ def paged_attention_v1(
     mtp: int = 1,
     q_scale=None,
     sliding_window: int = 0,
+    q_pre_quantized: bool = False,  # Added: whether Q is pre-quantized to FP8
 ):
     import torch
     from csrc.cpp_itfs.torch_utils import torch_to_c_types
 
     warpSize = torch.cuda.get_device_properties(out.device).warp_size
+    
+    # Determine if Q is pre-quantized based on dtype
+    if query.dtype in (torch.float8_e4m3fnuz, torch.float8_e4m3fn, torch.uint8):
+        q_pre_quantized = True
+    
     if kv_cache_dtype == "auto":
-        if query.dtype == torch.bfloat16:
+        if q_pre_quantized:
+            # Q is FP8, but output type is still bf16/fp16
+            dtype = "__hip_bfloat16"  # Default to bf16 for output
+            kv_dtype = "__hip_bfloat16"
+        elif query.dtype == torch.bfloat16:
             dtype = "__hip_bfloat16"
             kv_dtype = "__hip_bfloat16"
         elif query.dtype == torch.float16:
@@ -90,7 +102,10 @@ def paged_attention_v1(
         else:
             raise ValueError(f"Unsupported data type: {query.dtype}")
     elif kv_cache_dtype == "fp8" or kv_cache_dtype == "fp8_e4m3":
-        if query.dtype == torch.bfloat16:
+        if q_pre_quantized:
+            dtype = "__hip_bfloat16"  # Default to bf16 for output
+            kv_dtype = "uint8_t"
+        elif query.dtype == torch.bfloat16:
             dtype = "__hip_bfloat16"
             kv_dtype = "uint8_t"
         elif query.dtype == torch.float16:
@@ -142,6 +157,7 @@ def paged_attention_v1(
         partition_size,
         mtp,
         sliding_window_enabled=sliding_window_enabled,
+        q_pre_quantized=q_pre_quantized,
     )
 
     alibi_slopes_ptr = (

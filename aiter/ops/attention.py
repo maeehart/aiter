@@ -191,6 +191,7 @@ def paged_attention_v1(
     partition_size: int = 256,
     mtp: int = 1,
     sliding_window: int = 0,
+    q_pre_quantized: bool = False,  # Added: whether Q is pre-quantized to FP8
 ) -> torch.Tensor:
     paged_attention_v1_core(
         out,
@@ -213,6 +214,7 @@ def paged_attention_v1(
         partition_size,
         mtp,
         sliding_window=sliding_window,
+        q_pre_quantized=q_pre_quantized,
     )
     return out
 

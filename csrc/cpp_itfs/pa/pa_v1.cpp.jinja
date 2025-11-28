@@ -78,6 +78,11 @@ void {{func_name}}(void* out_ptr,
 
     paged_attention_ll4mi_QKV_mfma16_kernel<{{dtype}},                       
                                             {{kv_dtype}},
+                                            {% if q_pre_quantized %}
+                                            uint8_t,
+                                            {% else %}
+                                            {{dtype}},
+                                            {% endif %}
                                             {% if fp8_kv_dtype == 'auto' %}
                                             vllm::Fp8KVCacheDataType::kAuto,
                                             {% else %}
@@ -90,8 +95,9 @@ void {{func_name}}(void* out_ptr,
                                             gqa_ratio,
                                             {{mtp}},
                                             decltype(variant),
-                                            {{"true" if sliding_window_enabled else "false"}}>               
-    <<<grid, block, 0, reinterpret_cast<hipStream_t>(stream)>>>(reinterpret_cast<{{dtype}}*>(query_ptr),                      
+                                            {{"true" if sliding_window_enabled else "false"}},
+                                            {{"true" if q_pre_quantized else "false"}}>               
+    <<<grid, block, 0, reinterpret_cast<hipStream_t>(stream)>>>({% if q_pre_quantized %}reinterpret_cast<uint8_t*>(query_ptr){% else %}reinterpret_cast<{{dtype}}*>(query_ptr){% endif %},                      
                                     reinterpret_cast<{{kv_dtype}}*>(key_cache_ptr),                  
                                     reinterpret_cast<{{kv_dtype}}*>(value_cache_ptr),                
                                     scale,                          
