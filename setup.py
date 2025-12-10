@@ -158,6 +158,72 @@ else:
 
 if os.path.exists("aiter_meta") and os.path.isdir("aiter_meta"):
     shutil.rmtree("aiter_meta")
+
+
+def build_asm_kernels():
+    """Build custom ASM kernels (.s -> .co) for supported architectures."""
+    import subprocess
+    import glob
+
+    # Find clang from ROCm
+    clang_paths = [
+        "/opt/rocm/llvm/bin/clang",
+        shutil.which("clang"),
+    ]
+    clang = None
+    for path in clang_paths:
+        if path and os.path.exists(path):
+            clang = path
+            break
+
+    if clang is None:
+        print("[AITER] Warning: clang not found, skipping ASM kernel compilation")
+        return
+
+    # Architectures to build for
+    archs = ["gfx950", "gfx942"]
+
+    for arch in archs:
+        asm_dirs = glob.glob(f"{this_dir}/hsa/{arch}/*/")
+        for asm_dir in asm_dirs:
+            # Find .s files that need compilation
+            asm_files = glob.glob(os.path.join(asm_dir, "*.s"))
+            for asm_file in asm_files:
+                base_name = os.path.splitext(os.path.basename(asm_file))[0]
+                co_file = os.path.join(asm_dir, f"{base_name}_{arch}.co")
+
+                # Skip if .co already exists and is newer than .s
+                if os.path.exists(co_file):
+                    if os.path.getmtime(co_file) > os.path.getmtime(asm_file):
+                        print(f"[AITER] Skipping {asm_file} (up to date)")
+                        continue
+
+                print(f"[AITER] Compiling {asm_file} for {arch}...")
+                try:
+                    result = subprocess.run(
+                        [
+                            clang,
+                            "-target", "amdgcn-amd-amdhsa",
+                            "-mcpu=" + arch,
+                            "-x", "assembler",
+                            "-c", asm_file,
+                            "-o", co_file,
+                        ],
+                        capture_output=True,
+                        text=True,
+                    )
+                    if result.returncode == 0:
+                        print(f"[AITER] Successfully built {co_file}")
+                    else:
+                        print(f"[AITER] Warning: Failed to compile {asm_file}: {result.stderr}")
+                except Exception as e:
+                    print(f"[AITER] Warning: Error compiling {asm_file}: {e}")
+
+
+# Build ASM kernels before copying to aiter_meta
+if IS_ROCM:
+    build_asm_kernels()
+
 ## link "3rdparty", "hsa", "csrc" into "aiter_meta"
 shutil.copytree("3rdparty", "aiter_meta/3rdparty")
 shutil.copytree("hsa", "aiter_meta/hsa")
