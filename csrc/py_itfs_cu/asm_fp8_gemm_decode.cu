@@ -91,11 +91,12 @@ static AiterAsmKernel* get_kernel_for_shape(int M, int N, int K) {
     std::string arch = get_gpu_arch();
     
     // Select .co file based on architecture
+    // Files are in fp8_gemm_decode/ subdirectory under AITER_ASM_DIR
     std::string co_file;
     if (arch.find("gfx950") != std::string::npos) {
-        co_file = "fp8_gemm_decode_128x128_gfx950.co";
+        co_file = "fp8_gemm_decode/fp8_gemm_decode_128x128_gfx950.co";
     } else if (arch.find("gfx942") != std::string::npos) {
-        co_file = "fp8_gemm_decode_128x128_gfx942.co";
+        co_file = "fp8_gemm_decode/fp8_gemm_decode_128x128_gfx942.co";
     } else {
         TORCH_CHECK(false, "fp8_gemm_decode_asm: Unsupported GPU architecture: " + arch);
     }
@@ -108,7 +109,7 @@ static AiterAsmKernel* get_kernel_for_shape(int M, int N, int K) {
         if (!kernel_gfx950) {
             kernel_gfx950 = std::make_unique<AiterAsmKernel>(
                 "fp8_gemm_decode_128x128", 
-                "fp8_gemm_decode_128x128_gfx950.co"
+                "fp8_gemm_decode/fp8_gemm_decode_128x128_gfx950.co"
             );
         }
         return kernel_gfx950.get();
@@ -116,7 +117,7 @@ static AiterAsmKernel* get_kernel_for_shape(int M, int N, int K) {
         if (!kernel_gfx942) {
             kernel_gfx942 = std::make_unique<AiterAsmKernel>(
                 "fp8_gemm_decode_128x128", 
-                "fp8_gemm_decode_128x128_gfx942.co"
+                "fp8_gemm_decode/fp8_gemm_decode_128x128_gfx942.co"
             );
         }
         return kernel_gfx942.get();
