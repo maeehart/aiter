@@ -17,8 +17,8 @@ from typing import Tuple
 import torch
 from torch import Tensor
 
-from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR
-from ..jit.utils import get_gfx
+from ..jit.core import compile_ops
+from ..jit.utils.chip_info import get_gfx
 
 
 def gen_fp8_gemm_decode_fake_tensors(
