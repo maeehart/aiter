@@ -76,4 +76,5 @@ from .ops.mha import *
 from .ops.gradlib import *
 from .ops.trans_ragged_layout import *
 from .ops.sample import *
+from .ops.fp8_gemm_decode import fp8_gemm_decode, is_fp8_gemm_decode_available
 from . import mla
