@@ -367,6 +367,21 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_hipkittens_fp8_gemm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/hipkittens_fp8_gemm.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/hipkittens_fp8_gemm_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DUSE_HIPKITTENS'",
+            "'-I${HIPKITTENS_ROOT}/include'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_moe_asm": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/moe_op_pybind.cu'",

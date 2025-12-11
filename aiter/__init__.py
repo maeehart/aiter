@@ -76,4 +76,9 @@ from .ops.mha import *
 from .ops.gradlib import *
 from .ops.trans_ragged_layout import *
 from .ops.sample import *
+from .ops.hipkittens_gemm import (
+    hipkittens_fp8_gemm_decode,
+    is_hipkittens_available,
+    should_use_hipkittens_decode,
+)
 from . import mla
