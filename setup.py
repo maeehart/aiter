@@ -73,6 +73,16 @@ if IS_ROCM:
         ck_dir
     ), 'CK is needed by aiter, please make sure clone by "git clone --recursive https://github.com/ROCm/aiter.git" or "git submodule sync ; git submodule update --init --recursive"'
 
+    # Check for HipKittens submodule (required for FP8 GEMM decode kernels)
+    hipkittens_dir = f"{this_dir}/3rdparty/HipKittens"
+    if not os.path.exists(f"{hipkittens_dir}/include/kittens.cuh"):
+        print("[AITER] HipKittens submodule not found, initializing...")
+        os.system("git submodule sync")
+        os.system("git submodule update --init --recursive 3rdparty/HipKittens")
+        if not os.path.exists(f"{hipkittens_dir}/include/kittens.cuh"):
+            print("[AITER] WARNING: HipKittens not available. FP8 GEMM decode kernels will not be built.")
+            print("[AITER] To enable, run: git submodule update --init --recursive 3rdparty/HipKittens")
+
     if PREBUILD_KERNELS == 1:
         exclude_ops = [
             "libmha_fwd",

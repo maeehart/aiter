@@ -374,12 +374,11 @@
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-DUSE_HIPKITTENS'",
-            "f'-I{os.environ.get(\"THUNDERKITTENS_ROOT\", \"/workspace/dev/HipKittens\")}/include'"
+            "'-DUSE_HIPKITTENS'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
-            "f'{os.environ.get(\"THUNDERKITTENS_ROOT\", \"/workspace/dev/HipKittens\")}/include'"
+            "f'{AITER_META_DIR}/3rdparty/HipKittens/include'"
         ],
         "verbose": "False",
         "blob_gen_cmd": "''"
