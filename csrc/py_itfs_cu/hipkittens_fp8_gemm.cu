@@ -118,8 +118,8 @@ void hk_fp8_gemm_decode_memory_opt(
     const int lane_id = tid % 64;
     
     // Double-buffered shared memory
-    __shared__ alignas(128) fp8_t smem_A[2][TILE_M * TILE_K];
-    __shared__ alignas(128) fp8_t smem_B[2][TILE_N * TILE_K];
+    __shared__ fp8_t smem_A[2][TILE_M * TILE_K];
+    __shared__ fp8_t smem_B[2][TILE_N * TILE_K];
     
     // Register accumulators
     float acc[2][4] = {{0.0f}};
@@ -309,8 +309,8 @@ void hk_fp8_gemm_decode_tiny_m(
     const int k_start = k_split_idx * (K / split_k);
     const int k_end = (k_split_idx == split_k - 1) ? K : (k_split_idx + 1) * (K / split_k);
     
-    __shared__ alignas(128) fp8_t smem_A[16 * TILE_K];  // Small M, large K
-    __shared__ alignas(128) fp8_t smem_B[TILE_N * TILE_K];
+    __shared__ fp8_t smem_A[16 * TILE_K];  // Small M, large K
+    __shared__ fp8_t smem_B[TILE_N * TILE_K];
     
     // Partial accumulators (will need atomic add if split_k > 1)
     float acc[16] = {0.0f};  // One per M row, per N column handled by this thread
