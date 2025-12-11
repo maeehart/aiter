@@ -375,10 +375,12 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-DUSE_HIPKITTENS'",
-            "'-I${HIPKITTENS_ROOT}/include'"
+            "f'-I{os.environ.get(\"THUNDERKITTENS_ROOT\", \"/workspace/dev/HipKittens\")}/include'"
         ],
         "extra_ldflags": "None",
-        "extra_include": [],
+        "extra_include": [
+            "f'{os.environ.get(\"THUNDERKITTENS_ROOT\", \"/workspace/dev/HipKittens\")}/include'"
+        ],
         "verbose": "False",
         "blob_gen_cmd": "''"
     },

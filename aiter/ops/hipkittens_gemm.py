@@ -130,3 +130,4 @@ def should_use_hipkittens_decode(M: int, N: int, K: int) -> bool:
     
     return is_decode_shape
 
+
