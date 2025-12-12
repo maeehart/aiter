@@ -100,46 +100,70 @@ void hk_moe_stage2_kernel_mma(
     
     const int num_k_tiles = (inter_dim + K_STEP - 1) / K_STEP;
     
+    const int lane = threadIdx.x;
+    constexpr int VEC_SIZE = 8;  // bf16 elements per float4
+    constexpr int TOTAL_VECS = (BLOCK_SIZE * K_STEP) / VEC_SIZE;
+    constexpr int VECS_PER_THREAD = TOTAL_VECS / NUM_THREADS;
+    
     for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) {
         const int k_start = k_tile * K_STEP;
         
-        // === Cooperative load input tile (contiguous - no gather) ===
-        const int lane = threadIdx.x;
-        const int total_elems = BLOCK_SIZE * K_STEP;
-        const int elems_per_thread = total_elems / NUM_THREADS;
-        
+        // === Cooperative vectorized load input tile [BLOCK_SIZE x K_STEP] ===
         #pragma unroll
-        for (int i = 0; i < elems_per_thread; i++) {
-            int idx = lane * elems_per_thread + i;
-            int m = idx / K_STEP;
-            int k = idx % K_STEP;
+        for (int v = 0; v < VECS_PER_THREAD; v++) {
+            int vec_idx = lane * VECS_PER_THREAD + v;
+            int flat_idx = vec_idx * VEC_SIZE;
+            int m = flat_idx / K_STEP;
+            int k = flat_idx % K_STEP;
             
             int row = row_start + m;
-            bf16 val = __float2bfloat16(0.0f);
+            bf16 vals[VEC_SIZE];
             
-            if (row < sorted_M && (k_start + k) < inter_dim) {
-                val = intermediate[row * inter_dim + k_start + k];
+            if (row < sorted_M && (k_start + k + VEC_SIZE - 1) < inter_dim) {
+                float4 vec = *reinterpret_cast<const float4*>(&intermediate[row * inter_dim + k_start + k]);
+                *reinterpret_cast<float4*>(vals) = vec;
+            } else {
+                #pragma unroll
+                for (int j = 0; j < VEC_SIZE; j++) {
+                    vals[j] = (row < sorted_M && (k_start + k + j) < inter_dim) 
+                        ? intermediate[row * inter_dim + k_start + k + j]
+                        : __float2bfloat16(0.0f);
+                }
             }
             
-            As[{m, k}] = val;
+            #pragma unroll
+            for (int j = 0; j < VEC_SIZE; j++) {
+                As[{m, k + j}] = vals[j];
+            }
         }
         
-        // === Cooperative load weight tile ===
+        // === Cooperative vectorized load weight tile [BLOCK_SIZE x K_STEP] ===
         #pragma unroll
-        for (int i = 0; i < elems_per_thread; i++) {
-            int idx = lane * elems_per_thread + i;
-            int n = idx / K_STEP;
-            int k = idx % K_STEP;
+        for (int v = 0; v < VECS_PER_THREAD; v++) {
+            int vec_idx = lane * VECS_PER_THREAD + v;
+            int flat_idx = vec_idx * VEC_SIZE;
+            int n = flat_idx / K_STEP;
+            int k = flat_idx % K_STEP;
             
             int col = col_start + n;
-            bf16 val = __float2bfloat16(0.0f);
+            bf16 vals[VEC_SIZE];
             
-            if (col < model_dim && (k_start + k) < inter_dim) {
-                // w2 layout: [num_experts, model_dim, inter_dim]
-                val = w2[expert_id * model_dim * inter_dim + col * inter_dim + k_start + k];
+            if (col < model_dim && (k_start + k + VEC_SIZE - 1) < inter_dim) {
+                float4 vec = *reinterpret_cast<const float4*>(&w2[expert_id * model_dim * inter_dim + col * inter_dim + k_start + k]);
+                *reinterpret_cast<float4*>(vals) = vec;
+            } else {
+                #pragma unroll
+                for (int j = 0; j < VEC_SIZE; j++) {
+                    vals[j] = (col < model_dim && (k_start + k + j) < inter_dim)
+                        ? w2[expert_id * model_dim * inter_dim + col * inter_dim + k_start + k + j]
+                        : __float2bfloat16(0.0f);
+                }
             }
             
-            Bs[{n, k}] = val;
+            #pragma unroll
+            for (int j = 0; j < VEC_SIZE; j++) {
+                Bs[{n, k + j}] = vals[j];
+            }
         }
         
         __syncthreads();

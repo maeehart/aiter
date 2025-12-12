@@ -109,52 +109,89 @@ void hk_moe_stage1_kernel_mma(
     
     const int num_k_tiles = (model_dim + K_STEP - 1) / K_STEP;
     
+    const int lane = threadIdx.x;
+    constexpr int VEC_SIZE = 8;  // bf16 elements per float4
+    
     for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) {
         const int k_start = k_tile * K_STEP;
         
-        // === Cooperative load input tile with gather via sorted_ids ===
-        // Each thread loads some elements
-        const int lane = threadIdx.x;
-        const int total_elems = BLOCK_SIZE * K_STEP;
-        const int elems_per_thread = total_elems / NUM_THREADS;
+        // === Cooperative vectorized load input tile with gather via sorted_ids ===
+        // For gather: we load K values per row with vectorization
+        // Each thread handles some complete rows (to enable vec loads within a row)
+        constexpr int ROWS_PER_BLOCK = BLOCK_SIZE;
+        constexpr int VECS_PER_ROW = K_STEP / VEC_SIZE;  // 64/8 = 8 vectors per row
+        constexpr int TOTAL_VECS = ROWS_PER_BLOCK * VECS_PER_ROW;  // 128 * 8 = 1024
+        constexpr int VECS_PER_THREAD = TOTAL_VECS / NUM_THREADS;  // 1024/512 = 2
         
         #pragma unroll
-        for (int i = 0; i < elems_per_thread; i++) {
-            int idx = lane * elems_per_thread + i;
-            int m = idx / K_STEP;
-            int k = idx % K_STEP;
+        for (int v = 0; v < VECS_PER_THREAD; v++) {
+            int vec_idx = lane * VECS_PER_THREAD + v;
+            int m = vec_idx / VECS_PER_ROW;
+            int k = (vec_idx % VECS_PER_ROW) * VEC_SIZE;
             
             int row = row_start + m;
-            bf16 val = __float2bfloat16(0.0f);
+            bf16 vals[VEC_SIZE];
             
-            if (row < sorted_M && (k_start + k) < model_dim) {
+            if (row < sorted_M && (k_start + k + VEC_SIZE - 1) < model_dim) {
                 int packed_id = sorted_ids[row];
                 int token_id = packed_id & 0xFFFFFF;
                 if (token_id >= 0 && token_id < num_tokens) {
-                    val = hidden_states[token_id * model_dim + k_start + k];
+                    // Vectorized load from hidden_states
+                    float4 vec = *reinterpret_cast<const float4*>(&hidden_states[token_id * model_dim + k_start + k]);
+                    *reinterpret_cast<float4*>(vals) = vec;
+                } else {
+                    #pragma unroll
+                    for (int j = 0; j < VEC_SIZE; j++) vals[j] = __float2bfloat16(0.0f);
+                }
+            } else {
+                // Boundary case - scalar loads
+                int packed_id = (row < sorted_M) ? sorted_ids[row] : -1;
+                int token_id = (packed_id >= 0) ? (packed_id & 0xFFFFFF) : -1;
+                #pragma unroll
+                for (int j = 0; j < VEC_SIZE; j++) {
+                    vals[j] = (token_id >= 0 && token_id < num_tokens && (k_start + k + j) < model_dim)
+                        ? hidden_states[token_id * model_dim + k_start + k + j]
+                        : __float2bfloat16(0.0f);
                 }
             }
             
-            // Use indexed access via operator[]
-            As[{m, k}] = val;
+            #pragma unroll
+            for (int j = 0; j < VEC_SIZE; j++) {
+                As[{m, k + j}] = vals[j];
+            }
         }
         
-        // === Cooperative load weight tile (contiguous access) ===
+        // === Cooperative vectorized load weight tile (contiguous) ===
+        constexpr int TOTAL_VECS_W = (BLOCK_SIZE * K_STEP) / VEC_SIZE;
+        constexpr int VECS_PER_THREAD_W = TOTAL_VECS_W / NUM_THREADS;
+        
         #pragma unroll
-        for (int i = 0; i < elems_per_thread; i++) {
-            int idx = lane * elems_per_thread + i;
-            int n = idx / K_STEP;
-            int k = idx % K_STEP;
+        for (int v = 0; v < VECS_PER_THREAD_W; v++) {
+            int vec_idx = lane * VECS_PER_THREAD_W + v;
+            int flat_idx = vec_idx * VEC_SIZE;
+            int n = flat_idx / K_STEP;
+            int k = flat_idx % K_STEP;
             
             int col = col_start + n;
-            bf16 val = __float2bfloat16(0.0f);
+            bf16 vals[VEC_SIZE];
             
-            if (col < total_n && (k_start + k) < model_dim) {
+            if (col < total_n && (k_start + k + VEC_SIZE - 1) < model_dim) {
                 // w1 layout: [num_experts, inter_dim*2, model_dim]
-                val = w1[expert_id * total_n * model_dim + col * model_dim + k_start + k];
+                float4 vec = *reinterpret_cast<const float4*>(&w1[expert_id * total_n * model_dim + col * model_dim + k_start + k]);
+                *reinterpret_cast<float4*>(vals) = vec;
+            } else {
+                #pragma unroll
+                for (int j = 0; j < VEC_SIZE; j++) {
+                    vals[j] = (col < total_n && (k_start + k + j) < model_dim)
+                        ? w1[expert_id * total_n * model_dim + col * model_dim + k_start + k + j]
+                        : __float2bfloat16(0.0f);
+                }
             }
             
-            Bs[{n, k}] = val;
+            #pragma unroll
+            for (int j = 0; j < VEC_SIZE; j++) {
+                Bs[{n, k + j}] = vals[j];
+            }
         }
         
         __syncthreads();

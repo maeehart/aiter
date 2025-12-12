@@ -36,21 +36,27 @@ The MoE computation is split into three stages:
    - Register tiles (`rt_bf`, `rt_fl`) and shared tiles (`st_bf`)
    - Scheduling barriers and priority hints for instruction scheduling
 
-3. **Tiled Computation**
+3. **Vectorized Memory Access**
+   - float4 (8 bf16) vectorized loads from global memory
+   - ~3.5x speedup over element-by-element loading
+   - Applied to both input/intermediate and weight loading
+
+4. **Tiled Computation**
    - BLOCK_SIZE=128, K_STEP=64 per HipKittens GEMM pattern
    - Shared memory staging with swizzled layout
    - Cooperative loading across all 512 threads
 
-### ⏳ Pending (For Further Optimization)
+### ⏳ Remaining Bottlenecks
 
-4. **Ping-Pong Pipelining** (~1.5-2x potential gain)
-   - Overlap compute with next tile's memory loads
-   - Double-buffering in shared memory
-   - Currently loads are sequential, not overlapped
+5. **Async Pipelining** (would need AMD buffer load intrinsics)
+   - HipKittens uses `load_global_to_register_buffer` for true async
+   - Requires `gl` (global layout) abstraction for buffer operations
+   - Current implementation loads sequentially
 
-5. **Gather/Scatter Optimization**
-   - Pre-sort tokens to enable contiguous access
-   - Reduce atomic operation overhead in Stage 2
+6. **Gather/Scatter Overhead** (inherent to MoE)
+   - Stage 1 gather: `sorted_ids` lookup breaks coalesced access
+   - Stage 2 scatter: Atomic operations for weighted accumulation
+   - Would require pre-sorting or algorithm redesign to optimize
 
 ## Current Performance
 
@@ -58,15 +64,15 @@ Tested on MI300X with model_dim=4096, inter_dim=4096, 8 experts, topk=2:
 
 | Batch | AITER (TFLOPs) | HipKittens (TFLOPs) | Speedup |
 |-------|----------------|---------------------|---------|
-| 1024  | 533            | 35.6                | 0.09x   |
-| 4096  | 474            | 50.0                | 0.11x   |
-| 8192  | 555            | 52.6                | 0.09x   |
+| 1024  | 527            | 137                 | 0.35x   |
+| 4096  | 474            | 172                 | 0.37x   |
+| 8192  | 556            | 184                 | 0.33x   |
 
-**Performance Analysis**: The MMA-based implementation achieves 35-52 TFLOPs, significantly improved from the scalar version (~7 TFLOPs). The remaining gap vs AITER (400-550 TFLOPs) is due to:
-1. **Input gather overhead**: Stage 1 gathers input via `sorted_ids`, breaking coalesced memory access
+**Performance Analysis**: The MMA + vectorized loads implementation achieves 137-184 TFLOPs (~3.5x improvement from MMA-only). The remaining gap vs AITER (~0.33-0.37x) is due to:
+1. **Input gather overhead**: Stage 1 gathers input via `sorted_ids`, breaking coalesced memory access patterns
 2. **Scatter-add overhead**: Stage 2 uses atomic operations for weighted accumulation
-3. **No pipelining**: Sequential load-compute instead of overlapped execution
-4. **Tile size mismatch**: 128x128 tiles may not be optimal for MoE workloads
+3. **No async pipelining**: True async memory operations require AMD's buffer load intrinsics
+4. **MoE-specific patterns**: The gather/scatter pattern is inherent to MoE and can't be fully optimized
 
 ## Running the Benchmark
 
