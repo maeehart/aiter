@@ -1,50 +1,43 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 /**
- * HipKittens MoE Stage 1: Gate-Up Projection
+ * HipKittens MoE Stage 1: Gate-Up Projection with MMA Instructions
  * 
- * Optimized implementation with:
- * - Tiled computation
- * - Shared memory for weight reuse
+ * Based on HipKittens GEMM patterns:
+ * - Uses st_bf shared tiles + rt_bf/rt_fl register tiles
+ * - mma_ABt for efficient matrix multiplication
  * - XCD-aware scheduling for L2 cache optimization
+ * - 8-wave kernel pattern (512 threads)
+ * 
+ * Reference: https://hazyresearch.stanford.edu/blog/2025-11-09-amd-brr
  */
 
 #include "hk_moe_kernel.cuh"
 
 using namespace kittens;
 
-// Configuration
+// Configuration following HipKittens GEMM pattern
 namespace s1_cfg {
-    constexpr int BLOCK_M = 32;      // Tokens per block
-    constexpr int BLOCK_N = 128;     // Output dims per block (reduced for shared memory)
-    constexpr int BLOCK_K = 64;      // K per iteration
-    constexpr int NUM_THREADS = 256; // 2 threads per output column
-    constexpr int VEC_SIZE = 8;      // bf16 elements per float4 load
+    constexpr int BLOCK_SIZE = 128;   // Output tile size (M and N dimension of output tile)
+    constexpr int K_STEP = 64;        // K dimension per iteration
+    constexpr int REG_BLOCK = BLOCK_SIZE / 4;  // 32 - register tile dimension per warp
+    constexpr int DOT_SLICE = 16;     // MMA native dimension (16x16x16)
+    
+    constexpr int NUM_WARPS = 8;
+    constexpr int NUM_THREADS = WARP_THREADS * NUM_WARPS;  // 64 * 8 = 512
     
     // XCD-aware scheduling parameters
-    constexpr int WGM = 4;           // Workgroup grouping factor for L2 locality
+    constexpr int WGM = 4;            // Workgroup grouping factor for L2 locality
 }
 
-// XCD-aware block ID transformation
-__device__ __forceinline__ int xcd_transform_chunked(
-    int workgroup_id, 
-    int num_workgroups,
-    int num_xcds,
-    int chunk_size 
-) {
-    int xcd = workgroup_id % num_xcds;
-    int block = num_xcds * chunk_size;
-    int limit = (num_workgroups / block) * block;
-    if (workgroup_id > limit) return workgroup_id;
-    int local_pid = workgroup_id / num_xcds;
-    int chunk_idx = local_pid / chunk_size;
-    int pos_in_chunk = local_pid % chunk_size;
-    return chunk_idx * block + xcd * chunk_size + pos_in_chunk;
-}
+// Shared tile types for input and weight
+using s1_st_tile = st_bf<s1_cfg::BLOCK_SIZE, s1_cfg::K_STEP>;  // [128, 64] shared bf16 tile
 
-// Tiled kernel with shared memory and XCD-aware scheduling
+// Group for cooperative loading
+using s1_group = group<s1_cfg::NUM_WARPS>;
+
 __global__ __launch_bounds__(s1_cfg::NUM_THREADS, 2)
-void hk_moe_stage1_kernel_tiled(
+void hk_moe_stage1_kernel_mma(
     const bf16* __restrict__ hidden_states,  // [num_tokens, model_dim]
     const bf16* __restrict__ w1,             // [num_experts, inter_dim*2, model_dim]
     bf16* __restrict__ intermediate,         // [sorted_M, inter_dim*2]
@@ -61,18 +54,27 @@ void hk_moe_stage1_kernel_tiled(
 ) {
     using namespace s1_cfg;
     
-    // Shared memory with padding to avoid bank conflicts
-    __shared__ float s_input[BLOCK_M][BLOCK_K + 8];
-    __shared__ float s_weight[BLOCK_N][BLOCK_K + 8];
+    extern __shared__ alignment_dummy __shm[];
+    shared_allocator al((int*)&__shm[0]);
+    
+    // Allocate shared memory tiles
+    s1_st_tile (&As) = al.allocate<s1_st_tile>();   // Input tile [BLOCK_SIZE, K_STEP]
+    s1_st_tile (&Bs) = al.allocate<s1_st_tile>();   // Weight tile [BLOCK_SIZE, K_STEP]
     
     const int total_n = inter_dim * 2;
+    
+    // Register tiles for MMA - 32x16 bf16 tiles and 32x32 fp32 accumulators
+    rt_bf<REG_BLOCK, DOT_SLICE> a_tile, b_tile;
+    rt_fl<REG_BLOCK, REG_BLOCK, ducks::rt_layout::col> C_accum[2];  // Two 32x32 accumulators
+    zero(C_accum[0]);
+    zero(C_accum[1]);
     
     // XCD-aware block scheduling
     int wgid = (blockIdx.y * gridDim.x) + blockIdx.x;
     const int NUM_WGS = gridDim.x * gridDim.y;
     
-    // Apply XCD-aware transformation (use kittens::NUM_XCDS = 8 for MI300X/MI325X)
-    wgid = xcd_transform_chunked(wgid, NUM_WGS, kittens::NUM_XCDS, WGM * WGM);
+    // Apply XCD-aware transformation
+    wgid = chiplet_transform_chunked(wgid, NUM_WGS, NUM_XCDS, WGM * WGM);
     
     // Swizzle for better L2 within the same XCD
     int num_wgid_in_group = WGM * num_n_blocks;
@@ -80,163 +82,178 @@ void hk_moe_stage1_kernel_tiled(
     int first_pid_m = group_id * WGM;
     int group_size_m = min(num_m_blocks - first_pid_m, WGM);
     
-    // Compute block indices with swizzling
-    int block_m_idx, block_n_idx;
+    int pid_m, pid_n;
     if (group_size_m > 0) {
-        block_m_idx = first_pid_m + ((wgid % num_wgid_in_group) % group_size_m);
-        block_n_idx = (wgid % num_wgid_in_group) / group_size_m;
+        pid_m = first_pid_m + ((wgid % num_wgid_in_group) % group_size_m);
+        pid_n = (wgid % num_wgid_in_group) / group_size_m;
     } else {
-        block_m_idx = blockIdx.x;
-        block_n_idx = blockIdx.y;
-    }
-    
-    const int row_start = block_m_idx * BLOCK_M;
-    const int col_start = block_n_idx * BLOCK_N;
-    
-    if (row_start >= sorted_M) return;
-    
-    // Get expert for this block
-    const int tile_id = row_start / block_m_sorting;
-    const int expert_id = sorted_expert_ids[tile_id];
-    
-    // Thread mapping: first BLOCK_N threads each handle one output column
-    const int thread_col = threadIdx.x % BLOCK_N;  // Column this thread computes
-    const int col = col_start + thread_col;
-    const bool col_valid = (col < total_n) && (threadIdx.x < BLOCK_N);
-    
-    if (expert_id < 0 || expert_id >= num_experts) {
-        // Write zeros
-        if (col_valid) {
-            for (int m = 0; m < BLOCK_M; m++) {
-                int row = row_start + m;
-                if (row < sorted_M) {
-                    intermediate[row * total_n + col] = __float2bfloat16(0.0f);
-                }
-            }
-        }
         return;
     }
     
-    // Accumulator - threads < BLOCK_N each handle one column for all BLOCK_M rows
-    float acc[BLOCK_M];
-    #pragma unroll
-    for (int m = 0; m < BLOCK_M; m++) {
-        acc[m] = 0.0f;
-    }
+    const int row_start = pid_m * BLOCK_SIZE;
+    const int col_start = pid_n * BLOCK_SIZE;
     
-    // Main loop over K
-    const int num_k_tiles = (model_dim + BLOCK_K - 1) / BLOCK_K;
+    if (row_start >= sorted_M || col_start >= total_n) return;
+    
+    // Get expert for this block (using first row in tile)
+    const int tile_id = row_start / block_m_sorting;
+    const int expert_id = sorted_expert_ids[tile_id];
+    
+    if (expert_id < 0 || expert_id >= num_experts) return;
+    
+    // Warp mapping: 8 warps arranged in a 2x4 grid
+    // Warps 0-3 are row 0, warps 4-7 are row 1
+    const int warp_id = warpid();
+    const int warp_row = warp_id / 4;  // 0 or 1
+    const int warp_col = warp_id % 4;  // 0, 1, 2, or 3
+    
+    const int num_k_tiles = (model_dim + K_STEP - 1) / K_STEP;
     
     for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) {
-        const int k_start = k_tile * BLOCK_K;
+        const int k_start = k_tile * K_STEP;
         
-        __syncthreads();
+        // === Cooperative load input tile with gather via sorted_ids ===
+        // Each thread loads some elements
+        const int lane = threadIdx.x;
+        const int total_elems = BLOCK_SIZE * K_STEP;
+        const int elems_per_thread = total_elems / NUM_THREADS;
         
-        // Cooperative vectorized load of input tile [BLOCK_M x BLOCK_K]
-        // Each thread loads VEC_SIZE (8) elements per iteration
-        {
-            constexpr int TOTAL_ELEMS = BLOCK_M * BLOCK_K;
-            constexpr int ELEMS_PER_THREAD = TOTAL_ELEMS / NUM_THREADS;
+        #pragma unroll
+        for (int i = 0; i < elems_per_thread; i++) {
+            int idx = lane * elems_per_thread + i;
+            int m = idx / K_STEP;
+            int k = idx % K_STEP;
             
-            #pragma unroll
-            for (int i = 0; i < ELEMS_PER_THREAD; i += VEC_SIZE) {
-                int idx = threadIdx.x * ELEMS_PER_THREAD + i;
-                int m = idx / BLOCK_K;
-                int k = idx % BLOCK_K;
-                
-                if (m < BLOCK_M) {
-                    int row = row_start + m;
-                    float vals[VEC_SIZE] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-                    
-                    if (row < sorted_M) {
-                        int packed_id = sorted_ids[row];
-                        int token_id = packed_id & 0xFFFFFF;
-                        if (token_id >= 0 && token_id < num_tokens && (k_start + k + VEC_SIZE - 1) < model_dim) {
-                            // Vectorized load - 8 bf16 = 16 bytes = float4
-                            float4 vec = *reinterpret_cast<const float4*>(&hidden_states[token_id * model_dim + k_start + k]);
-                            const bf16* bf = reinterpret_cast<const bf16*>(&vec);
-                            #pragma unroll
-                            for (int j = 0; j < VEC_SIZE; j++) {
-                                vals[j] = __bfloat162float(bf[j]);
-                            }
-                        } else if (token_id >= 0 && token_id < num_tokens) {
-                            // Scalar fallback for boundary
-                            for (int j = 0; j < VEC_SIZE && (k_start + k + j) < model_dim; j++) {
-                                vals[j] = __bfloat162float(hidden_states[token_id * model_dim + k_start + k + j]);
-                            }
-                        }
-                    }
-                    
-                    #pragma unroll
-                    for (int j = 0; j < VEC_SIZE; j++) {
-                        s_input[m][k + j] = vals[j];
-                    }
+            int row = row_start + m;
+            bf16 val = __float2bfloat16(0.0f);
+            
+            if (row < sorted_M && (k_start + k) < model_dim) {
+                int packed_id = sorted_ids[row];
+                int token_id = packed_id & 0xFFFFFF;
+                if (token_id >= 0 && token_id < num_tokens) {
+                    val = hidden_states[token_id * model_dim + k_start + k];
                 }
             }
+            
+            // Use indexed access via operator[]
+            As[{m, k}] = val;
         }
         
-        // Cooperative vectorized load of weight tile [BLOCK_N x BLOCK_K]
-        {
-            constexpr int TOTAL_ELEMS = BLOCK_N * BLOCK_K;
-            constexpr int ELEMS_PER_THREAD = TOTAL_ELEMS / NUM_THREADS;
+        // === Cooperative load weight tile (contiguous access) ===
+        #pragma unroll
+        for (int i = 0; i < elems_per_thread; i++) {
+            int idx = lane * elems_per_thread + i;
+            int n = idx / K_STEP;
+            int k = idx % K_STEP;
             
-            #pragma unroll
-            for (int i = 0; i < ELEMS_PER_THREAD; i += VEC_SIZE) {
-                int idx = threadIdx.x * ELEMS_PER_THREAD + i;
-                int n = idx / BLOCK_K;
-                int k = idx % BLOCK_K;
-                
-                if (n < BLOCK_N) {
-                    int out_col = col_start + n;
-                    float vals[VEC_SIZE] = {0.0f};
-                    
-                    if (out_col < total_n && (k_start + k + VEC_SIZE - 1) < model_dim) {
-                        // Vectorized load
-                        float4 vec = *reinterpret_cast<const float4*>(&w1[expert_id * total_n * model_dim + out_col * model_dim + k_start + k]);
-                        const bf16* bf = reinterpret_cast<const bf16*>(&vec);
-                        #pragma unroll
-                        for (int j = 0; j < VEC_SIZE; j++) {
-                            vals[j] = __bfloat162float(bf[j]);
-                        }
-                    } else if (out_col < total_n) {
-                        // Scalar fallback for boundary
-                        for (int j = 0; j < VEC_SIZE && (k_start + k + j) < model_dim; j++) {
-                            vals[j] = __bfloat162float(w1[expert_id * total_n * model_dim + out_col * model_dim + k_start + k + j]);
-                        }
-                    }
-                    
-                    #pragma unroll
-                    for (int j = 0; j < VEC_SIZE; j++) {
-                        s_weight[n][k + j] = vals[j];
-                    }
-                }
+            int col = col_start + n;
+            bf16 val = __float2bfloat16(0.0f);
+            
+            if (col < total_n && (k_start + k) < model_dim) {
+                // w1 layout: [num_experts, inter_dim*2, model_dim]
+                val = w1[expert_id * total_n * model_dim + col * model_dim + k_start + k];
             }
+            
+            Bs[{n, k}] = val;
         }
         
         __syncthreads();
         
-        // Compute - threads < BLOCK_N each compute one column for all rows
-        if (col_valid) {
-            int k_end = min(BLOCK_K, model_dim - k_start);
-            #pragma unroll
-            for (int m = 0; m < BLOCK_M; m++) {
-                float sum = 0.0f;
-                #pragma unroll 8
-                for (int k = 0; k < k_end; k++) {
-                    sum += s_input[m][k] * s_weight[thread_col][k];
-                }
-                acc[m] += sum;
+        // === Compute MMA for this K tile ===
+        // Process K_STEP in DOT_SLICE (16) chunks
+        // Each K chunk: As[warp_row*64 + offset, kk:kk+16] @ Bs[warp_col*32, kk:kk+16]^T
+        
+        #pragma unroll
+        for (int kk = 0; kk < K_STEP / DOT_SLICE; kk++) {
+            // Load subtiles from shared memory to registers
+            // Warp (warp_row, warp_col) computes output tile at:
+            //   rows: [warp_row*64, warp_row*64+64)
+            //   cols: [warp_col*32, warp_col*32+32)
+            
+            // For MMA, we need:
+            // C_accum[0] = As[warp_row*64:warp_row*64+32, :] @ Bs[warp_col*32:warp_col*32+32, :]^T
+            // C_accum[1] = As[warp_row*64+32:warp_row*64+64, :] @ Bs[...]^T
+            
+            // Load A subtile for first 32 rows
+            load(a_tile, subtile_inplace<REG_BLOCK, DOT_SLICE>(As, {warp_row * 2, kk}));
+            // Load B subtile 
+            load(b_tile, subtile_inplace<REG_BLOCK, DOT_SLICE>(Bs, {warp_col, kk}));
+            
+            __builtin_amdgcn_sched_barrier(0);
+            
+            // MMA: C_accum[0] += a_tile @ b_tile^T
+            __builtin_amdgcn_s_setprio(1);
+            mma_ABt(C_accum[0], a_tile, b_tile, C_accum[0]);
+            __builtin_amdgcn_s_setprio(0);
+            
+            __builtin_amdgcn_sched_barrier(0);
+            
+            // Load A subtile for second 32 rows
+            load(a_tile, subtile_inplace<REG_BLOCK, DOT_SLICE>(As, {warp_row * 2 + 1, kk}));
+            
+            __builtin_amdgcn_sched_barrier(0);
+            
+            // MMA: C_accum[1] += a_tile @ b_tile^T
+            __builtin_amdgcn_s_setprio(1);
+            mma_ABt(C_accum[1], a_tile, b_tile, C_accum[1]);
+            __builtin_amdgcn_s_setprio(0);
+            
+            __builtin_amdgcn_sched_barrier(0);
+        }
+        
+        __syncthreads();
+    }
+    
+    // === Store results ===
+    // C_accum[0] is 32x32 at output rows [row_start + warp_row*64, row_start + warp_row*64 + 32)
+    // C_accum[1] is 32x32 at output rows [row_start + warp_row*64 + 32, row_start + warp_row*64 + 64)
+    // Both at cols [col_start + warp_col*32, col_start + warp_col*32 + 32)
+    
+    // rt_fl<32, 32, col> layout: tiles[height][width] where height=width=2 (each 16x16 tile)
+    // For col layout, each lane's data layout is:
+    //   row_offset = 4 * (laneid / 16)  -- 4 consecutive rows
+    //   col_offset = laneid % 16        -- one column
+    //   data[0].x, data[0].y, data[1].x, data[1].y for rows row_offset+0,+1,+2,+3
+    
+    const int out_row_base_0 = row_start + warp_row * 64;
+    const int out_row_base_1 = row_start + warp_row * 64 + 32;
+    const int out_col_base = col_start + warp_col * 32;
+    const int lane_id = laneid();
+    const int row_off = 4 * (lane_id / 16);
+    const int col_off = lane_id % 16;
+    
+    // C_accum[0] - first 32x32 output tile
+    #pragma unroll
+    for (int tile_row = 0; tile_row < 2; tile_row++) {
+        #pragma unroll
+        for (int tile_col = 0; tile_col < 2; tile_col++) {
+            const auto& tile = C_accum[0].tiles[tile_row][tile_col];
+            int base_row = out_row_base_0 + tile_row * 16 + row_off;
+            int col = out_col_base + tile_col * 16 + col_off;
+            
+            if (col < total_n) {
+                if (base_row + 0 < sorted_M) intermediate[(base_row + 0) * total_n + col] = __float2bfloat16(tile.data[0].x);
+                if (base_row + 1 < sorted_M) intermediate[(base_row + 1) * total_n + col] = __float2bfloat16(tile.data[0].y);
+                if (base_row + 2 < sorted_M) intermediate[(base_row + 2) * total_n + col] = __float2bfloat16(tile.data[1].x);
+                if (base_row + 3 < sorted_M) intermediate[(base_row + 3) * total_n + col] = __float2bfloat16(tile.data[1].y);
             }
         }
     }
     
-    // Store results
-    if (col_valid) {
+    // C_accum[1] - second 32x32 output tile
+    #pragma unroll
+    for (int tile_row = 0; tile_row < 2; tile_row++) {
         #pragma unroll
-        for (int m = 0; m < BLOCK_M; m++) {
-            int row = row_start + m;
-            if (row < sorted_M) {
-                intermediate[row * total_n + col] = __float2bfloat16(acc[m]);
+        for (int tile_col = 0; tile_col < 2; tile_col++) {
+            const auto& tile = C_accum[1].tiles[tile_row][tile_col];
+            int base_row = out_row_base_1 + tile_row * 16 + row_off;
+            int col = out_col_base + tile_col * 16 + col_off;
+            
+            if (col < total_n) {
+                if (base_row + 0 < sorted_M) intermediate[(base_row + 0) * total_n + col] = __float2bfloat16(tile.data[0].x);
+                if (base_row + 1 < sorted_M) intermediate[(base_row + 1) * total_n + col] = __float2bfloat16(tile.data[0].y);
+                if (base_row + 2 < sorted_M) intermediate[(base_row + 2) * total_n + col] = __float2bfloat16(tile.data[1].x);
+                if (base_row + 3 < sorted_M) intermediate[(base_row + 3) * total_n + col] = __float2bfloat16(tile.data[1].y);
             }
         }
     }
@@ -248,13 +265,18 @@ void dispatch_hk_moe_stage1(const moe_stage1_globals& g) {
     
     const int total_n = g.inter_dim * 2;
     
-    const int num_m_blocks = (g.sorted_M + BLOCK_M - 1) / BLOCK_M;
-    const int num_n_blocks = (total_n + BLOCK_N - 1) / BLOCK_N;
+    const int num_m_blocks = (g.sorted_M + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const int num_n_blocks = (total_n + BLOCK_SIZE - 1) / BLOCK_SIZE;
     
     dim3 grid(num_m_blocks, num_n_blocks);
     dim3 block(NUM_THREADS);
     
-    hk_moe_stage1_kernel_tiled<<<grid, block, 0, g.stream>>>(
+    // Set dynamic shared memory size
+    size_t smem_size = 65536;  // 64KB
+    hipFuncSetAttribute((void*)hk_moe_stage1_kernel_mma, 
+                        hipFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    
+    hk_moe_stage1_kernel_mma<<<grid, block, smem_size, g.stream>>>(
         g.hidden_states.raw_ptr,
         g.w1.raw_ptr,
         g.intermediate.raw_ptr,
