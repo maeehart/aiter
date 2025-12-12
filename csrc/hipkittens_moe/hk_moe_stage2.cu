@@ -18,9 +18,10 @@
 using namespace kittens;
 
 // Configuration following HipKittens GEMM pattern
+// Reduced K_STEP to 32 for better occupancy (2 blocks/CU vs 1)
 namespace s2_cfg {
     constexpr int BLOCK_SIZE = 128;   // Output tile size
-    constexpr int K_STEP = 64;        // K dimension per iteration
+    constexpr int K_STEP = 32;        // K dimension per iteration (32 = half LDS for 2x occupancy)
     constexpr int REG_BLOCK = BLOCK_SIZE / 4;  // 32
     constexpr int DOT_SLICE = 16;     // MMA native dimension
     
@@ -272,7 +273,7 @@ void dispatch_hk_moe_stage2(const moe_stage2_globals& g, float* output_fp32) {
     dim3 grid(num_m_blocks, num_n_blocks);
     dim3 block(NUM_THREADS);
     
-    size_t smem_size = 65536;
+    size_t smem_size = 32768;  // 32KB (K_STEP=32 instead of 64)
     hipFuncSetAttribute((void*)hk_moe_stage2_kernel_mma, 
                         hipFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     
