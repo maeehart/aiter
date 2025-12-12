@@ -41,8 +41,14 @@ The MoE computation is split into three stages:
    - ~3.5x speedup over element-by-element loading
    - Applied to both input/intermediate and weight loading
 
-4. **Tiled Computation**
-   - BLOCK_SIZE=128, K_STEP=64 per HipKittens GEMM pattern
+4. **Occupancy Optimization**
+   - Reduced K_STEP from 64 to 32
+   - Halved shared memory: 64KB → 32KB per block
+   - Enables 2 concurrent blocks per CU (was 1)
+   - ~20% additional speedup
+
+5. **Tiled Computation**
+   - BLOCK_SIZE=128, K_STEP=32 per HipKittens GEMM pattern
    - Shared memory staging with swizzled layout
    - Cooperative loading across all 512 threads
 
@@ -64,15 +70,20 @@ Tested on MI300X with model_dim=4096, inter_dim=4096, 8 experts, topk=2:
 
 | Batch | AITER (TFLOPs) | HipKittens (TFLOPs) | Speedup |
 |-------|----------------|---------------------|---------|
-| 1024  | 527            | 137                 | 0.35x   |
-| 4096  | 474            | 172                 | 0.37x   |
-| 8192  | 556            | 184                 | 0.33x   |
+| 1024  | 633            | 143                 | 0.44x   |
+| 4096  | 469            | 215                 | 0.46x   |
+| 8192  | 553            | 225                 | 0.41x   |
 
-**Performance Analysis**: The MMA + vectorized loads implementation achieves 137-184 TFLOPs (~3.5x improvement from MMA-only). The remaining gap vs AITER (~0.33-0.37x) is due to:
-1. **Input gather overhead**: Stage 1 gathers input via `sorted_ids`, breaking coalesced memory access patterns
+**Performance Analysis**: Rocprof profiling reveals:
+- **MFMA Utilization**: HipKittens achieves 72% MFMA utilization (vs CK's 16-18%)
+- **Parallelism**: CK launches 8192 small kernels with better overall GPU utilization
+- **Current TFLOPs**: 143-225 TFLOPs, up from initial scalar implementation (~7 TFLOPs)
+
+The remaining gap vs AITER (~0.41-0.46x) is due to:
+1. **Input gather overhead**: Stage 1 gathers input via `sorted_ids`, breaking coalesced memory access
 2. **Scatter-add overhead**: Stage 2 uses atomic operations for weighted accumulation
-3. **No async pipelining**: True async memory operations require AMD's buffer load intrinsics
-4. **MoE-specific patterns**: The gather/scatter pattern is inherent to MoE and can't be fully optimized
+3. **Kernel launch granularity**: Single large kernel vs many small kernels
+4. **MoE-specific patterns**: The gather/scatter pattern is inherent to MoE
 
 ## Running the Benchmark
 
