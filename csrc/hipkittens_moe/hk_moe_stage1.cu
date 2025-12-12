@@ -17,14 +17,14 @@
 using namespace kittens;
 
 // Configuration following HipKittens GEMM pattern
-// Reduced K_STEP to 32 for better occupancy (2 blocks/CU vs 1)
+// K_STEP=64 to match AITER CK configuration
 namespace s1_cfg {
     constexpr int BLOCK_SIZE = 128;   // Output tile size (M and N dimension of output tile)
-    constexpr int K_STEP = 32;        // K dimension per iteration (32 = half LDS for 2x occupancy)
+    constexpr int K_STEP = 64;        // K dimension per iteration (match AITER's 64)
     constexpr int REG_BLOCK = BLOCK_SIZE / 4;  // 32 - register tile dimension per warp
     constexpr int DOT_SLICE = 16;     // MMA native dimension (16x16x16)
     
-    constexpr int NUM_WARPS = 8;
+    constexpr int NUM_WARPS = 8;      // 8 warps = 512 threads for 128x128 tile
     constexpr int NUM_THREADS = WARP_THREADS * NUM_WARPS;  // 64 * 8 = 512
     
     // XCD-aware scheduling parameters
@@ -37,7 +37,7 @@ using s1_st_tile = st_bf<s1_cfg::BLOCK_SIZE, s1_cfg::K_STEP>;  // [128, 64] shar
 // Group for cooperative loading
 using s1_group = group<s1_cfg::NUM_WARPS>;
 
-__global__ __launch_bounds__(s1_cfg::NUM_THREADS, 2)
+__global__ __launch_bounds__(s1_cfg::NUM_THREADS, 1)
 void hk_moe_stage1_kernel_mma(
     const bf16* __restrict__ hidden_states,  // [num_tokens, model_dim]
     const bf16* __restrict__ w1,             // [num_experts, inter_dim*2, model_dim]
@@ -309,8 +309,8 @@ void dispatch_hk_moe_stage1(const moe_stage1_globals& g) {
     dim3 grid(num_m_blocks, num_n_blocks);
     dim3 block(NUM_THREADS);
     
-    // Set dynamic shared memory size (reduced for better occupancy)
-    size_t smem_size = 32768;  // 32KB (K_STEP=32 instead of 64)
+    // Set dynamic shared memory size (match AITER's K_STEP=64)
+    size_t smem_size = 65536;  // 64KB for K_STEP=64
     hipFuncSetAttribute((void*)hk_moe_stage1_kernel_mma, 
                         hipFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     

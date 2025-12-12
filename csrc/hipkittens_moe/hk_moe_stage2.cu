@@ -18,10 +18,10 @@
 using namespace kittens;
 
 // Configuration following HipKittens GEMM pattern
-// Reduced K_STEP to 32 for better occupancy (2 blocks/CU vs 1)
+// Match AITER CK configuration: K_STEP=64 for fewer iterations
 namespace s2_cfg {
     constexpr int BLOCK_SIZE = 128;   // Output tile size
-    constexpr int K_STEP = 32;        // K dimension per iteration (32 = half LDS for 2x occupancy)
+    constexpr int K_STEP = 64;        // K dimension per iteration (match AITER's 64)
     constexpr int REG_BLOCK = BLOCK_SIZE / 4;  // 32
     constexpr int DOT_SLICE = 16;     // MMA native dimension
     
@@ -34,7 +34,7 @@ namespace s2_cfg {
 // Shared tile types
 using s2_st_tile = st_bf<s2_cfg::BLOCK_SIZE, s2_cfg::K_STEP>;
 
-__global__ __launch_bounds__(s2_cfg::NUM_THREADS, 2)
+__global__ __launch_bounds__(s2_cfg::NUM_THREADS, 1)
 void hk_moe_stage2_kernel_mma(
     const bf16* __restrict__ intermediate,   // [sorted_M, inter_dim]
     const bf16* __restrict__ w2,             // [num_experts, model_dim, inter_dim]
@@ -197,10 +197,10 @@ void hk_moe_stage2_kernel_mma(
         __syncthreads();
     }
     
-    // === Weighted scatter-add to output ===
-    // Each warp handles its portion of the 128x128 output tile
-    // C_accum[0]: rows [warp_row*64, warp_row*64+32), cols [warp_col*32, warp_col*32+32)
-    // C_accum[1]: rows [warp_row*64+32, warp_row*64+64), cols [...]
+    // === Optimized Weighted scatter-add to output ===
+    // Optimization 1: Local accumulation - if consecutive rows map to same token, accumulate first
+    // Optimization 2: Prefetch sorted_ids and weights to reduce memory traffic
+    // Optimization 3: Coalesce atomics by processing same token_id together
     
     const int out_row_base_0 = row_start + warp_row * 64;
     const int out_row_base_1 = row_start + warp_row * 64 + 32;
@@ -209,59 +209,72 @@ void hk_moe_stage2_kernel_mma(
     const int row_off = 4 * (lane_id / 16);
     const int col_off = lane_id % 16;
     
-    // C_accum[0] scatter-add
-    #pragma unroll
-    for (int tile_row = 0; tile_row < 2; tile_row++) {
+    // Helper lambda for optimized scatter with local accumulation
+    auto scatter_with_local_accum = [&](const auto& C_tile, int base_row_start) {
         #pragma unroll
-        for (int tile_col = 0; tile_col < 2; tile_col++) {
-            const auto& tile = C_accum[0].tiles[tile_row][tile_col];
-            int base_row = out_row_base_0 + tile_row * 16 + row_off;
-            int col = out_col_base + tile_col * 16 + col_off;
-            
-            if (col < model_dim) {
-                float vals[4] = {tile.data[0].x, tile.data[0].y, tile.data[1].x, tile.data[1].y};
-                #pragma unroll
-                for (int r = 0; r < 4; r++) {
-                    int row = base_row + r;
-                    if (row < sorted_M) {
-                        int packed_id = sorted_ids[row];
-                        int token_id = packed_id & 0xFFFFFF;
-                        if (token_id >= 0 && token_id < num_tokens) {
-                            float weight = sorted_weights[row];
-                            atomicAdd(&output_fp32[token_id * model_dim + col], vals[r] * weight);
+        for (int tile_row = 0; tile_row < 2; tile_row++) {
+            #pragma unroll
+            for (int tile_col = 0; tile_col < 2; tile_col++) {
+                const auto& tile = C_tile.tiles[tile_row][tile_col];
+                int base_row = base_row_start + tile_row * 16 + row_off;
+                int col = out_col_base + tile_col * 16 + col_off;
+                
+                if (col < model_dim) {
+                    float vals[4] = {tile.data[0].x, tile.data[0].y, tile.data[1].x, tile.data[1].y};
+                    
+                    // Prefetch token_ids and weights for 4 consecutive rows
+                    int token_ids[4];
+                    float weights[4];
+                    #pragma unroll
+                    for (int r = 0; r < 4; r++) {
+                        int row = base_row + r;
+                        if (row < sorted_M) {
+                            int packed_id = sorted_ids[row];
+                            token_ids[r] = packed_id & 0xFFFFFF;
+                            weights[r] = sorted_weights[row];
+                        } else {
+                            token_ids[r] = -1;
+                            weights[r] = 0.0f;
                         }
+                    }
+                    
+                    // Local accumulation: merge contributions to same token
+                    // Process in order, accumulating if same token as previous
+                    int prev_token = -1;
+                    float accum = 0.0f;
+                    
+                    #pragma unroll
+                    for (int r = 0; r < 4; r++) {
+                        int token_id = token_ids[r];
+                        float weighted_val = vals[r] * weights[r];
+                        
+                        if (token_id >= 0 && token_id < num_tokens) {
+                            if (token_id == prev_token) {
+                                // Same token as previous - accumulate locally
+                                accum += weighted_val;
+                            } else {
+                                // Different token - flush previous accumulation
+                                if (prev_token >= 0) {
+                                    atomicAdd(&output_fp32[prev_token * model_dim + col], accum);
+                                }
+                                prev_token = token_id;
+                                accum = weighted_val;
+                            }
+                        }
+                    }
+                    
+                    // Flush final accumulation
+                    if (prev_token >= 0) {
+                        atomicAdd(&output_fp32[prev_token * model_dim + col], accum);
                     }
                 }
             }
         }
-    }
+    };
     
-    // C_accum[1] scatter-add
-    #pragma unroll
-    for (int tile_row = 0; tile_row < 2; tile_row++) {
-        #pragma unroll
-        for (int tile_col = 0; tile_col < 2; tile_col++) {
-            const auto& tile = C_accum[1].tiles[tile_row][tile_col];
-            int base_row = out_row_base_1 + tile_row * 16 + row_off;
-            int col = out_col_base + tile_col * 16 + col_off;
-            
-            if (col < model_dim) {
-                float vals[4] = {tile.data[0].x, tile.data[0].y, tile.data[1].x, tile.data[1].y};
-                #pragma unroll
-                for (int r = 0; r < 4; r++) {
-                    int row = base_row + r;
-                    if (row < sorted_M) {
-                        int packed_id = sorted_ids[row];
-                        int token_id = packed_id & 0xFFFFFF;
-                        if (token_id >= 0 && token_id < num_tokens) {
-                            float weight = sorted_weights[row];
-                            atomicAdd(&output_fp32[token_id * model_dim + col], vals[r] * weight);
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // Apply optimized scatter to both accumulator tiles
+    scatter_with_local_accum(C_accum[0], out_row_base_0);
+    scatter_with_local_accum(C_accum[1], out_row_base_1);
 }
 
 void dispatch_hk_moe_stage2(const moe_stage2_globals& g, float* output_fp32) {
@@ -273,7 +286,7 @@ void dispatch_hk_moe_stage2(const moe_stage2_globals& g, float* output_fp32) {
     dim3 grid(num_m_blocks, num_n_blocks);
     dim3 block(NUM_THREADS);
     
-    size_t smem_size = 32768;  // 32KB (K_STEP=32 instead of 64)
+    size_t smem_size = 65536;  // 64KB for K_STEP=64
     hipFuncSetAttribute((void*)hk_moe_stage2_kernel_mma, 
                         hipFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     

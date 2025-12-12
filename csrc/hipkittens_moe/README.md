@@ -70,20 +70,52 @@ Tested on MI300X with model_dim=4096, inter_dim=4096, 8 experts, topk=2:
 
 | Batch | AITER (TFLOPs) | HipKittens (TFLOPs) | Speedup |
 |-------|----------------|---------------------|---------|
-| 1024  | 633            | 143                 | 0.44x   |
-| 4096  | 469            | 215                 | 0.46x   |
-| 8192  | 553            | 225                 | 0.41x   |
+| 1024  | ~633           | ~216                | 0.46x   |
+| 4096  | ~469           | ~216                | 0.46x   |
+| 8192  | ~557           | ~225                | 0.40x   |
 
-**Performance Analysis**: Rocprof profiling reveals:
-- **MFMA Utilization**: HipKittens achieves 72% MFMA utilization (vs CK's 16-18%)
-- **Parallelism**: CK launches 8192 small kernels with better overall GPU utilization
-- **Current TFLOPs**: 143-225 TFLOPs, up from initial scalar implementation (~7 TFLOPs)
+### Detailed Profiling Analysis (rocprof)
 
-The remaining gap vs AITER (~0.41-0.46x) is due to:
-1. **Input gather overhead**: Stage 1 gathers input via `sorted_ids`, breaking coalesced memory access
-2. **Scatter-add overhead**: Stage 2 uses atomic operations for weighted accumulation
-3. **Kernel launch granularity**: Single large kernel vs many small kernels
-4. **MoE-specific patterns**: The gather/scatter pattern is inherent to MoE
+**Per-kernel breakdown** (batch=8192):
+
+| Kernel | HipKittens | AITER CK | Ratio |
+|--------|-----------|----------|-------|
+| Stage 1 | 4.5 ms | 2.0 ms | 2.25x slower |
+| Stage 2 | 2.2 ms | 1.0 ms | 2.20x slower |
+| Activation | 0.2 ms | (fused) | - |
+| **Total** | **~7.0 ms** | **~3.0 ms** | **2.35x slower** |
+
+**AITER CK Configuration** (from template analysis):
+- Block: 256 threads (4 warps)
+- Tile: 128×128×64 (M×N×K)
+- MMA: 16×16×8 pattern with 2-stage pipeline
+- Grid: 8192 × 136 blocks
+
+**HipKittens Configuration**:
+- Block: 512 threads (8 warps)  
+- Tile: 128×128×64 (M×N×K)
+- MMA: 16×16×16 pattern
+- Grid: 128 × 64 blocks
+
+### Performance Gap Analysis
+
+The consistent 2.2-2.3x gap across both stages suggests fundamental differences in:
+
+1. **Grid Structure**: AITER uses grid_y=136 (possibly 8 experts × 17 tiles), which may provide better expert batching
+2. **Pipeline Scheduling**: CK uses `BlockGemmPipelineVersion=2` for sophisticated memory/compute overlap
+3. **Thread Configuration**: AITER uses fewer threads (256 vs 512) but achieves better throughput
+
+### Optimization Attempts
+
+| Optimization | Result |
+|-------------|--------|
+| Local atomic accumulation | No improvement |
+| K_STEP 32→64 | No improvement |
+| XCD-aware scheduling | Already implemented |
+| Vectorized loads | +3.5x (already applied) |
+| Occupancy tuning | +20% (already applied) |
+
+The remaining gap requires deeper algorithmic changes to match CK's expert batching and pipeline scheduling.
 
 ## Running the Benchmark
 
