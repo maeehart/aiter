@@ -17,18 +17,12 @@
 
 using namespace kittens;
 
-// Kernel configuration - matching HipKittens GEMM optimal settings
-constexpr int BLOCK_SIZE = 256;     // Block size for M/N dimensions
-constexpr int K_STEP = 64;          // K dimension step
-constexpr int REG_BLOCK = BLOCK_SIZE / 4;  // Register tile dimension (64)
-constexpr int DOT_SLICE = 16;       // mma slice dimension
-
-// Number of warps per block
-constexpr int HK_NUM_WARPS = 8;
-constexpr int HK_NUM_THREADS = WARP_THREADS * HK_NUM_WARPS;  // 64 * 8 = 512
-
-// XCD-aware scheduling parameters (from HipKittens)
-constexpr int WGM = 4;  // Workgroup multiplier for chunked transform
+// Common configuration constants - used only in struct methods below
+namespace hk_moe_common {
+    constexpr int BLOCK_SIZE_DEFAULT = 256;
+    constexpr int HK_NUM_WARPS = 8;
+    constexpr int HK_NUM_THREADS = WARP_THREADS * HK_NUM_WARPS;  // 64 * 8 = 512
+}
 
 // Global memory layout types for MoE
 // Using 4D layout with all runtime dimensions
@@ -41,7 +35,7 @@ gl<T, -1, -1, -1, -1> make_gl_4d(T* data, size_t batch, size_t depth, size_t row
 }
 
 // Group type for collective operations
-using HKGroup = kittens::group<HK_NUM_WARPS>;
+using HKGroup = kittens::group<hk_moe_common::HK_NUM_WARPS>;
 
 // MoE Stage 1 globals structure
 struct moe_stage1_globals {
@@ -61,11 +55,11 @@ struct moe_stage1_globals {
     hipStream_t stream;
     
     dim3 grid() const {
-        int tiles_M = ceil_div(sorted_M, BLOCK_SIZE);
-        int tiles_N = ceil_div(inter_dim * 2, BLOCK_SIZE);
+        int tiles_M = ceil_div(sorted_M, hk_moe_common::BLOCK_SIZE_DEFAULT);
+        int tiles_N = ceil_div(inter_dim * 2, hk_moe_common::BLOCK_SIZE_DEFAULT);
         return dim3(tiles_N * tiles_M);
     }
-    dim3 block() const { return dim3(HK_NUM_THREADS); }
+    dim3 block() const { return dim3(hk_moe_common::HK_NUM_THREADS); }
     size_t dynamic_shared_memory() const { return 65536; }
 };
 
@@ -88,11 +82,11 @@ struct moe_stage2_globals {
     hipStream_t stream;
     
     dim3 grid() const {
-        int tiles_M = ceil_div(sorted_M, BLOCK_SIZE);
-        int tiles_N = ceil_div(model_dim, BLOCK_SIZE);
+        int tiles_M = ceil_div(sorted_M, hk_moe_common::BLOCK_SIZE_DEFAULT);
+        int tiles_N = ceil_div(model_dim, hk_moe_common::BLOCK_SIZE_DEFAULT);
         return dim3(tiles_N * tiles_M);
     }
-    dim3 block() const { return dim3(HK_NUM_THREADS); }
+    dim3 block() const { return dim3(hk_moe_common::HK_NUM_THREADS); }
     size_t dynamic_shared_memory() const { return 65536; }
 };
 
