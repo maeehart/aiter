@@ -30,26 +30,27 @@ The MoE computation is split into three stages:
    - L2-friendly block swizzling within each XCD
    - Improves cache hit rate for weight tiles
 
-2. **Vectorized Loads**
-   - float4 loads (8 bf16 elements per load)
-   - Reduces memory load instructions by 8x
-   - Applied to both input and weight loading
+2. **MMA Instructions**
+   - Uses HipKittens `mma_ABt` with MFMA 16x16x16 bf16 instructions
+   - 8-wave kernel pattern (512 threads) for 128x128 output tiles
+   - Register tiles (`rt_bf`, `rt_fl`) and shared tiles (`st_bf`)
+   - Scheduling barriers and priority hints for instruction scheduling
 
 3. **Tiled Computation**
-   - BLOCK_M=32, BLOCK_N=128, BLOCK_K=64
-   - Shared memory staging with bank conflict avoidance
-   - Cooperative loading across all threads
+   - BLOCK_SIZE=128, K_STEP=64 per HipKittens GEMM pattern
+   - Shared memory staging with swizzled layout
+   - Cooperative loading across all 512 threads
 
-### ⏳ Pending (Required for Competitive Performance)
+### ⏳ Pending (For Further Optimization)
 
-4. **MMA Instructions** (Most Important - ~50x potential gain)
-   - Replace scalar multiply-accumulate with MFMA 16x16x16
-   - Requires kernel restructuring around 16x16 tiles
-   - Need warp-level coordination for tile loading
-
-5. **Ping-Pong Pipelining** (~1.5-2x potential gain)
+4. **Ping-Pong Pipelining** (~1.5-2x potential gain)
    - Overlap compute with next tile's memory loads
    - Double-buffering in shared memory
+   - Currently loads are sequential, not overlapped
+
+5. **Gather/Scatter Optimization**
+   - Pre-sort tokens to enable contiguous access
+   - Reduce atomic operation overhead in Stage 2
 
 ## Current Performance
 
@@ -57,11 +58,15 @@ Tested on MI300X with model_dim=4096, inter_dim=4096, 8 experts, topk=2:
 
 | Batch | AITER (TFLOPs) | HipKittens (TFLOPs) | Speedup |
 |-------|----------------|---------------------|---------|
-| 1024  | 319            | 7.05                | 0.02x   |
-| 4096  | 467            | 7.79                | 0.02x   |
-| 8192  | 556            | 7.83                | 0.01x   |
+| 1024  | 533            | 35.6                | 0.09x   |
+| 4096  | 474            | 50.0                | 0.11x   |
+| 8192  | 555            | 52.6                | 0.09x   |
 
-**Root Cause of Performance Gap**: The current implementation uses scalar multiply-accumulate loops instead of MFMA instructions. Each MFMA 16x16x16 instruction can process 4096 FMA operations, while scalar code does 1 FMA per instruction.
+**Performance Analysis**: The MMA-based implementation achieves 35-52 TFLOPs, significantly improved from the scalar version (~7 TFLOPs). The remaining gap vs AITER (400-550 TFLOPs) is due to:
+1. **Input gather overhead**: Stage 1 gathers input via `sorted_ids`, breaking coalesced memory access
+2. **Scatter-add overhead**: Stage 2 uses atomic operations for weighted accumulation
+3. **No pipelining**: Sequential load-compute instead of overlapped execution
+4. **Tile size mismatch**: 128x128 tiles may not be optimal for MoE workloads
 
 ## Running the Benchmark
 
