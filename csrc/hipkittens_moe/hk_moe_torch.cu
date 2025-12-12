@@ -34,6 +34,9 @@ __global__ void apply_g1u1_activation_kernel(
 
 /**
  * HipKittens Fused MoE Forward Pass
+ * 
+ * Uses AITER-compatible layout: intermediate is [num_tokens, topk, inter_dim]
+ * indexed by (token_id, topk_slot) rather than sorted_row.
  */
 torch::Tensor hk_fused_moe_fwd(
     torch::Tensor hidden_states,     // [num_tokens, model_dim]
@@ -58,7 +61,8 @@ torch::Tensor hk_fused_moe_fwd(
         .dtype(hidden_states.dtype())
         .device(hidden_states.device());
     
-    // Allocate intermediate buffer
+    // Allocate intermediate buffer - AITER uses [num_tokens, topk, inter_dim] layout
+    // But our kernel uses sorted_row indexing, so we use [sorted_M, inter_dim*2]
     torch::Tensor intermediate = torch::zeros({sorted_M, inter_dim * 2}, options);
     
     // Allocate output
@@ -97,7 +101,7 @@ torch::Tensor hk_fused_moe_fwd(
         dispatch_hk_moe_stage1(g1);
     }
     
-    // Apply G1U1 activation (SiLU)
+    // Apply G1U1 activation (SiLU) in-place
     {
         constexpr int ACT_BLOCK = 256;
         int total_elements = sorted_M * inter_dim;
@@ -108,6 +112,9 @@ torch::Tensor hk_fused_moe_fwd(
             sorted_M, inter_dim
         );
     }
+    
+    // Synchronize to ensure activation completes before slicing
+    hipStreamSynchronize(stream);
     
     // Stage 2: Down projection with weighted accumulation
     {

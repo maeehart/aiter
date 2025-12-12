@@ -25,6 +25,9 @@ except ImportError as e:
     print(f"HipKittens MoE not available: {e}")
     HIPKITTENS_AVAILABLE = False
 
+# Use PyTorch reference as ground truth (AITER ASM kernels have numerical differences at large sizes)
+USE_PYTORCH_REF = True
+
 # High batch sizes from CSV (tokens causing cache thrashing)
 HIGH_BATCH_SIZES = [480, 1547, 2907, 4132, 4644, 5913, 7339, 8613]
 
@@ -63,6 +66,10 @@ def run_benchmark(batch_sizes):
     print(f"HipKittens MoE Benchmark - High Batch Sizes")
     print(f"Config: model_dim={MOE_CONFIG['model_dim']}, inter_dim={MOE_CONFIG['inter_dim']}")
     print(f"        experts={MOE_CONFIG['num_experts']}, topk={MOE_CONFIG['topk']}")
+    if USE_PYTORCH_REF:
+        print(f"        Correctness: vs PyTorch reference (ground truth)")
+    else:
+        print(f"        Correctness: vs AITER")
     print(f"{'='*70}\n")
     
     results = []
@@ -71,10 +78,20 @@ def run_benchmark(batch_sizes):
         hidden, w1, w2, topk_w, topk_ids = create_inputs(bs, MOE_CONFIG)
         flops = calc_flops(bs, MOE_CONFIG)
         
+        # Get reference output for correctness check
+        if USE_PYTORCH_REF:
+            ref_out = torch_moe(hidden, w1, w2, topk_w, topk_ids, activation=ActivationType.Silu)
+            ref_name = "PyTorch"
+        else:
+            ref_out = None
+            ref_name = "AITER"
+        
         try:
             aiter_out, aiter_us = bench_aiter(hidden, w1, w2, topk_w, topk_ids)
             aiter_tf = flops / (aiter_us * 1e-6) / 1e12
             print(f"  AITER:      {aiter_us:8.2f} us, {aiter_tf:6.2f} TFLOPs")
+            if ref_out is None:
+                ref_out = aiter_out
         except Exception as e:
             print(f"  AITER:      Failed - {e}")
             aiter_out, aiter_us, aiter_tf = None, float('inf'), 0
@@ -85,12 +102,12 @@ def run_benchmark(batch_sizes):
                 hk_tf = flops / (hk_us * 1e-6) / 1e12
                 speedup = aiter_us / hk_us if hk_us > 0 else 0
                 print(f"  HipKittens: {hk_us:8.2f} us, {hk_tf:6.2f} TFLOPs, {speedup:.2f}x speedup")
-                if aiter_out is not None:
+                if ref_out is not None:
                     try:
-                        checkAllclose(aiter_out, hk_out, rtol=0.01, atol=1.0, msg=f"batch={bs}")
-                        print(f"  Correctness: PASS")
+                        checkAllclose(ref_out, hk_out, rtol=0.01, atol=1.0, msg=f"batch={bs}")
+                        print(f"  Correctness vs {ref_name}: PASS")
                     except AssertionError as e:
-                        print(f"  Correctness: FAIL")
+                        print(f"  Correctness vs {ref_name}: FAIL")
             except Exception as e:
                 print(f"  HipKittens: Failed - {e}")
                 hk_us, hk_tf, speedup = float('inf'), 0, 0
