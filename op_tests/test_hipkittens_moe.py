@@ -7,8 +7,19 @@ Benchmarks HipKittens MoE kernel against baseline AITER for high batch sizes.
 Based on CSV data showing performance issues at 4000-8600 tokens in prefill.
 
 Usage:
+    # Quick test with 3 batch sizes (1024, 4096, 8192)
+    python test_hipkittens_moe.py --quick
+    
+    # Full benchmark with all high batch sizes from CSV analysis
     python test_hipkittens_moe.py
+    
+    # Custom batch sizes
     python test_hipkittens_moe.py --batch-sizes 4000 6000 8000
+
+Output:
+    - Timing comparison (AITER vs HipKittens)
+    - TFLOPs achieved by each implementation
+    - Correctness check against PyTorch reference
 """
 
 import argparse
