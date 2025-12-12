@@ -90,3 +90,31 @@ try:
 except ImportError:
     # Iris not available, skip import
     IRIS_COMM_AVAILABLE = False
+
+# Import HipKittens MoE module (optional, requires HipKittens submodule)
+try:
+    from .hipkittens_moe import (
+        hipkittens_fused_moe,
+        hipkittens_moe_stage1,
+        hipkittens_moe_stage2,
+        should_use_hipkittens_moe,
+        HIPKITTENS_BLOCK_CONFIGS,
+    )
+    HIPKITTENS_MOE_AVAILABLE = True
+except ImportError:
+    # HipKittens not available
+    HIPKITTENS_MOE_AVAILABLE = False
+
+# Import HipKittens MoE module (optional, requires HipKittens submodule)
+try:
+    from .hipkittens_moe import (
+        hipkittens_fused_moe,
+        hipkittens_moe_stage1,
+        hipkittens_moe_stage2,
+        should_use_hipkittens_moe,
+        HIPKITTENS_BLOCK_CONFIGS,
+    )
+    HIPKITTENS_MOE_AVAILABLE = True
+except ImportError:
+    # HipKittens not available
+    HIPKITTENS_MOE_AVAILABLE = False
