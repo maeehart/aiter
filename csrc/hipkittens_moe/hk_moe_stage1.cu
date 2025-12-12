@@ -28,6 +28,8 @@ namespace s1_cfg {
     constexpr int NUM_THREADS = WARP_THREADS * NUM_WARPS;  // 64 * 8 = 512
     
     // XCD-aware scheduling parameters
+    // WGM controls chunking for chiplet_transform_chunked
+    // TODO: Use template programming to tune WGM per batch size
     constexpr int WGM = 4;            // Workgroup grouping factor for L2 locality
 }
 
@@ -70,24 +72,26 @@ void hk_moe_stage1_kernel_mma(
     zero(C_accum[0]);
     zero(C_accum[1]);
     
-    // XCD-aware block scheduling
+    // Expert-aware block scheduling
+    // Key insight: tokens are sorted by expert, so consecutive M tiles share the same expert
+    // Strategy: Process all N tiles for a given M tile before moving to next M tile
+    // This keeps expert weights in L2 cache longer
+    
     int wgid = (blockIdx.y * gridDim.x) + blockIdx.x;
     const int NUM_WGS = gridDim.x * gridDim.y;
     
-    // Apply XCD-aware transformation
+    // Apply XCD-aware transformation to distribute work across chiplets
     wgid = chiplet_transform_chunked(wgid, NUM_WGS, NUM_XCDS, WGM * WGM);
     
-    // Swizzle for better L2 within the same XCD
-    int num_wgid_in_group = WGM * num_n_blocks;
-    int group_id = wgid / num_wgid_in_group;
-    int first_pid_m = group_id * WGM;
-    int group_size_m = min(num_m_blocks - first_pid_m, WGM);
+    if (wgid >= NUM_WGS) return;
     
-    int pid_m, pid_n;
-    if (group_size_m > 0) {
-        pid_m = first_pid_m + ((wgid % num_wgid_in_group) % group_size_m);
-        pid_n = (wgid % num_wgid_in_group) / group_size_m;
-    } else {
+    // Expert-aware N-first ordering: all N tiles for M=0, then all N tiles for M=1, etc.
+    // Block 0: (M=0, N=0), Block 1: (M=0, N=1), ..., Block num_n-1: (M=0, N=num_n-1)
+    // Block num_n: (M=1, N=0), ...
+    int pid_m = wgid / num_n_blocks;
+    int pid_n = wgid % num_n_blocks;
+    
+    if (pid_m >= num_m_blocks || pid_n >= num_n_blocks) {
         return;
     }
     

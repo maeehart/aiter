@@ -114,8 +114,42 @@ The consistent 2.2-2.3x gap across both stages suggests fundamental differences 
 | XCD-aware scheduling | Already implemented |
 | Vectorized loads | +3.5x (already applied) |
 | Occupancy tuning | +20% (already applied) |
+| **Expert-aware N-first scheduling** | **+8% at small batches (0.55x vs 0.51x)** |
 
-The remaining gap requires deeper algorithmic changes to match CK's expert batching and pipeline scheduling.
+### Expert-Aware Grid Scheduling
+
+Implemented N-first ordering within M tiles: process all output columns (N tiles) for a given token tile (M tile) before moving to the next token tile. This keeps expert weights in L2 cache longer.
+
+**Key insight**: Since tokens are already sorted by expert, consecutive M tiles share the same expert. By processing all N tiles for each M tile together, we maximize L2 cache hits for the expert's weight matrix.
+
+```
+Block ordering:
+  Block 0: (M=0, N=0), Block 1: (M=0, N=1), ..., Block N-1: (M=0, N=num_n-1)
+  Block N: (M=1, N=0), Block N+1: (M=1, N=1), ...
+```
+
+### Future Work: Template-Based Tuning
+
+The remaining gap requires template programming to tune parameters per batch size:
+
+```cpp
+// TODO: Generate specialized kernels for different configurations
+template<int BLOCK_SIZE, int K_STEP, int WGM>
+__global__ void hk_moe_stage1_kernel();
+
+// Dispatch based on batch size
+if (batch_size < 2048) {
+    hk_moe_stage1_kernel<128, 64, 8><<<grid, block>>>();
+} else {
+    hk_moe_stage1_kernel<128, 64, 4><<<grid, block>>>();
+}
+```
+
+Parameters to tune per batch size:
+- `WGM`: Workgroup grouping factor (4-16)
+- `K_STEP`: K-tile size (32-64)
+- `BLOCK_SIZE`: M/N tile size (64-256)
+- Thread count: 256 vs 512
 
 ## Running the Benchmark
 
