@@ -104,12 +104,13 @@ torch::Tensor hk_fused_moe_fwd(
     // Apply G1U1 activation (SiLU) in-place
     {
         constexpr int ACT_BLOCK = 256;
-        int total_elements = sorted_M * inter_dim;
+        const int sorted_M_valid = sorted_M;
+        int total_elements = sorted_M_valid * inter_dim;
         int num_blocks = (total_elements + ACT_BLOCK - 1) / ACT_BLOCK;
         
         apply_g1u1_activation_kernel<ACT_BLOCK><<<num_blocks, ACT_BLOCK, 0, stream>>>(
             reinterpret_cast<bf16*>(intermediate.data_ptr()),
-            sorted_M, inter_dim
+            sorted_M_valid, inter_dim
         );
     }
     

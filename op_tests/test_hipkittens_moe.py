@@ -114,11 +114,17 @@ def run_benchmark(batch_sizes):
                 speedup = aiter_us / hk_us if hk_us > 0 else 0
                 print(f"  HipKittens: {hk_us:8.2f} us, {hk_tf:6.2f} TFLOPs, {speedup:.2f}x speedup")
                 if ref_out is not None:
-                    try:
-                        checkAllclose(ref_out, hk_out, rtol=0.01, atol=1.0, msg=f"batch={bs}")
-                        print(f"  Correctness vs {ref_name}: PASS")
-                    except AssertionError as e:
-                        print(f"  Correctness vs {ref_name}: FAIL")
+                    # checkAllclose returns mismatch ratio (0.0 means perfect match).
+                    mismatch = checkAllclose(
+                        ref_out,
+                        hk_out,
+                        rtol=0.01,
+                        atol=1.0,
+                        msg=f"batch={bs}",
+                        printLog=False,
+                    )
+                    verdict = "PASS" if mismatch == 0 else f"FAIL (mismatch={mismatch:.1%})"
+                    print(f"  Correctness vs {ref_name}: {verdict}")
             except Exception as e:
                 print(f"  HipKittens: Failed - {e}")
                 hk_us, hk_tf, speedup = float('inf'), 0, 0

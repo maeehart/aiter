@@ -20,7 +20,7 @@ using namespace kittens;
 // K_STEP=64 to match AITER CK configuration
 namespace s1_cfg {
     constexpr int BLOCK_SIZE = 128;   // Output tile size (M and N dimension of output tile)
-    constexpr int K_STEP = 64;        // K dimension per iteration (match AITER's 64)
+    constexpr int K_STEP = 32;        // K dimension per iteration (stable baseline)
     constexpr int REG_BLOCK = BLOCK_SIZE / 4;  // 32 - register tile dimension per warp
     constexpr int DOT_SLICE = 16;     // MMA native dimension (16x16x16)
     
@@ -39,13 +39,14 @@ using s1_st_tile = st_bf<s1_cfg::BLOCK_SIZE, s1_cfg::K_STEP>;  // [128, 64] shar
 // Group for cooperative loading
 using s1_group = group<s1_cfg::NUM_WARPS>;
 
-__global__ __launch_bounds__(s1_cfg::NUM_THREADS, 1)
+__global__ __launch_bounds__(s1_cfg::NUM_THREADS, 2)
 void hk_moe_stage1_kernel_mma(
     const bf16* __restrict__ hidden_states,  // [num_tokens, model_dim]
     const bf16* __restrict__ w1,             // [num_experts, inter_dim*2, model_dim]
     bf16* __restrict__ intermediate,         // [sorted_M, inter_dim*2]
     const int32_t* __restrict__ sorted_ids,
     const int32_t* __restrict__ sorted_expert_ids,
+    const int32_t* __restrict__ num_valid_ids,  // [2]; num_valid_ids[0] = sorted_size (valid rows)
     const int sorted_M,
     const int num_tokens,
     const int model_dim,
@@ -56,6 +57,7 @@ void hk_moe_stage1_kernel_mma(
     const int num_n_blocks
 ) {
     using namespace s1_cfg;
+    const int sorted_M_valid = num_valid_ids[0];
     
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al((int*)&__shm[0]);
@@ -98,7 +100,7 @@ void hk_moe_stage1_kernel_mma(
     const int row_start = pid_m * BLOCK_SIZE;
     const int col_start = pid_n * BLOCK_SIZE;
     
-    if (row_start >= sorted_M || col_start >= total_n) return;
+    if (row_start >= sorted_M_valid || col_start >= total_n) return;
     
     // Get expert for this block (using first row in tile)
     const int tile_id = row_start / block_m_sorting;
@@ -130,76 +132,60 @@ void hk_moe_stage1_kernel_mma(
         
         #pragma unroll
         for (int v = 0; v < VECS_PER_THREAD; v++) {
+            // IMPORTANT: st_bf tiles use a swizzled shared-memory layout. Writing via
+            // `As[{m,k}] = ...` bypasses the expected vectorized LDS stores and can corrupt the tile.
+            // Use HipKittens' `store_shared_vec` + `tile.idx(...)` path, same as `global_to_shared.cuh`.
+            uint32_t As_ptr = reinterpret_cast<uintptr_t>(&As.data[0]);
+
             int vec_idx = lane * VECS_PER_THREAD + v;
             int m = vec_idx / VECS_PER_ROW;
             int k = (vec_idx % VECS_PER_ROW) * VEC_SIZE;
-            
+
             int row = row_start + m;
-            bf16 vals[VEC_SIZE];
-            
-            if (row < sorted_M && (k_start + k + VEC_SIZE - 1) < model_dim) {
+
+            // Each float4 is a raw 16B copy (8 bf16). We treat it as bits and store to LDS in two 8B chunks.
+            float4 buf = {0.f, 0.f, 0.f, 0.f};
+            if (row < sorted_M_valid && (k_start + k + VEC_SIZE - 1) < model_dim) {
                 int packed_id = sorted_ids[row];
                 int token_id = packed_id & 0xFFFFFF;
                 if (token_id >= 0 && token_id < num_tokens) {
-                    // Vectorized load from hidden_states
-                    float4 vec = *reinterpret_cast<const float4*>(&hidden_states[token_id * model_dim + k_start + k]);
-                    *reinterpret_cast<float4*>(vals) = vec;
-                } else {
-                    #pragma unroll
-                    for (int j = 0; j < VEC_SIZE; j++) vals[j] = __float2bfloat16(0.0f);
-                }
-            } else {
-                // Boundary case - scalar loads
-                int packed_id = (row < sorted_M) ? sorted_ids[row] : -1;
-                int token_id = (packed_id >= 0) ? (packed_id & 0xFFFFFF) : -1;
-                #pragma unroll
-                for (int j = 0; j < VEC_SIZE; j++) {
-                    vals[j] = (token_id >= 0 && token_id < num_tokens && (k_start + k + j) < model_dim)
-                        ? hidden_states[token_id * model_dim + k_start + k + j]
-                        : __float2bfloat16(0.0f);
+                    buf = load_global_vec4(reinterpret_cast<const float4*>(
+                        &hidden_states[token_id * model_dim + k_start + k]
+                    ));
                 }
             }
-            
-            #pragma unroll
-            for (int j = 0; j < VEC_SIZE; j++) {
-                As[{m, k + j}] = vals[j];
-            }
+
+            store_shared_vec(As.idx(As_ptr, {m, k}), {buf.x, buf.y});
+            store_shared_vec(As.idx(As_ptr, {m, k + 4}), {buf.z, buf.w});
         }
-        
-        // === Cooperative vectorized load weight tile (contiguous) ===
+
+// === Cooperative vectorized load weight tile (contiguous) ===
         constexpr int TOTAL_VECS_W = (BLOCK_SIZE * K_STEP) / VEC_SIZE;
         constexpr int VECS_PER_THREAD_W = TOTAL_VECS_W / NUM_THREADS;
         
         #pragma unroll
         for (int v = 0; v < VECS_PER_THREAD_W; v++) {
+            uint32_t Bs_ptr = reinterpret_cast<uintptr_t>(&Bs.data[0]);
+
             int vec_idx = lane * VECS_PER_THREAD_W + v;
             int flat_idx = vec_idx * VEC_SIZE;
             int n = flat_idx / K_STEP;
             int k = flat_idx % K_STEP;
-            
+
             int col = col_start + n;
-            bf16 vals[VEC_SIZE];
-            
+
+            float4 buf = {0.f, 0.f, 0.f, 0.f};
             if (col < total_n && (k_start + k + VEC_SIZE - 1) < model_dim) {
-                // w1 layout: [num_experts, inter_dim*2, model_dim]
-                float4 vec = *reinterpret_cast<const float4*>(&w1[expert_id * total_n * model_dim + col * model_dim + k_start + k]);
-                *reinterpret_cast<float4*>(vals) = vec;
-            } else {
-                #pragma unroll
-                for (int j = 0; j < VEC_SIZE; j++) {
-                    vals[j] = (col < total_n && (k_start + k + j) < model_dim)
-                        ? w1[expert_id * total_n * model_dim + col * model_dim + k_start + k + j]
-                        : __float2bfloat16(0.0f);
-                }
+                buf = load_global_vec4(reinterpret_cast<const float4*>(
+                    &w1[expert_id * total_n * model_dim + col * model_dim + k_start + k]
+                ));
             }
-            
-            #pragma unroll
-            for (int j = 0; j < VEC_SIZE; j++) {
-                Bs[{n, k + j}] = vals[j];
-            }
+
+            store_shared_vec(Bs.idx(Bs_ptr, {n, k}), {buf.x, buf.y});
+            store_shared_vec(Bs.idx(Bs_ptr, {n, k + 4}), {buf.z, buf.w});
         }
-        
-        __syncthreads();
+
+__syncthreads();
         
         // === Compute MMA for this K tile ===
         // Process K_STEP in DOT_SLICE (16) chunks
@@ -217,11 +203,12 @@ void hk_moe_stage1_kernel_mma(
             // C_accum[1] = As[warp_row*64+32:warp_row*64+64, :] @ Bs[...]^T
             
             // Load A subtile for first 32 rows
-            load(a_tile, subtile_inplace<REG_BLOCK, DOT_SLICE>(As, {warp_row * 2, kk}));
+            load(a_tile, subtile_inplace<REG_BLOCK, DOT_SLICE>(As, {warp_row, kk}));
             // Load B subtile 
             load(b_tile, subtile_inplace<REG_BLOCK, DOT_SLICE>(Bs, {warp_col, kk}));
             
             __builtin_amdgcn_sched_barrier(0);
+            asm volatile("s_waitcnt lgkmcnt(0)");
             
             // MMA: C_accum[0] += a_tile @ b_tile^T
             __builtin_amdgcn_s_setprio(1);
@@ -231,9 +218,10 @@ void hk_moe_stage1_kernel_mma(
             __builtin_amdgcn_sched_barrier(0);
             
             // Load A subtile for second 32 rows
-            load(a_tile, subtile_inplace<REG_BLOCK, DOT_SLICE>(As, {warp_row * 2 + 1, kk}));
+            load(a_tile, subtile_inplace<REG_BLOCK, DOT_SLICE>(As, {warp_row + 2, kk}));
             
             __builtin_amdgcn_sched_barrier(0);
+            asm volatile("s_waitcnt lgkmcnt(0)");
             
             // MMA: C_accum[1] += a_tile @ b_tile^T
             __builtin_amdgcn_s_setprio(1);
@@ -257,8 +245,8 @@ void hk_moe_stage1_kernel_mma(
     //   col_offset = laneid % 16        -- one column
     //   data[0].x, data[0].y, data[1].x, data[1].y for rows row_offset+0,+1,+2,+3
     
-    const int out_row_base_0 = row_start + warp_row * 64;
-    const int out_row_base_1 = row_start + warp_row * 64 + 32;
+    const int out_row_base_0 = row_start + warp_row * 32;
+    const int out_row_base_1 = row_start + (warp_row + 2) * 32;
     const int out_col_base = col_start + warp_col * 32;
     const int lane_id = laneid();
     const int row_off = 4 * (lane_id / 16);
@@ -274,10 +262,10 @@ void hk_moe_stage1_kernel_mma(
             int col = out_col_base + tile_col * 16 + col_off;
             
             if (col < total_n) {
-                if (base_row + 0 < sorted_M) intermediate[(base_row + 0) * total_n + col] = __float2bfloat16(tile.data[0].x);
-                if (base_row + 1 < sorted_M) intermediate[(base_row + 1) * total_n + col] = __float2bfloat16(tile.data[0].y);
-                if (base_row + 2 < sorted_M) intermediate[(base_row + 2) * total_n + col] = __float2bfloat16(tile.data[1].x);
-                if (base_row + 3 < sorted_M) intermediate[(base_row + 3) * total_n + col] = __float2bfloat16(tile.data[1].y);
+                if (base_row + 0 < sorted_M_valid) intermediate[(base_row + 0) * total_n + col] = __float2bfloat16(tile.data[0].x);
+                if (base_row + 1 < sorted_M_valid) intermediate[(base_row + 1) * total_n + col] = __float2bfloat16(tile.data[0].y);
+                if (base_row + 2 < sorted_M_valid) intermediate[(base_row + 2) * total_n + col] = __float2bfloat16(tile.data[1].x);
+                if (base_row + 3 < sorted_M_valid) intermediate[(base_row + 3) * total_n + col] = __float2bfloat16(tile.data[1].y);
             }
         }
     }
@@ -292,10 +280,10 @@ void hk_moe_stage1_kernel_mma(
             int col = out_col_base + tile_col * 16 + col_off;
             
             if (col < total_n) {
-                if (base_row + 0 < sorted_M) intermediate[(base_row + 0) * total_n + col] = __float2bfloat16(tile.data[0].x);
-                if (base_row + 1 < sorted_M) intermediate[(base_row + 1) * total_n + col] = __float2bfloat16(tile.data[0].y);
-                if (base_row + 2 < sorted_M) intermediate[(base_row + 2) * total_n + col] = __float2bfloat16(tile.data[1].x);
-                if (base_row + 3 < sorted_M) intermediate[(base_row + 3) * total_n + col] = __float2bfloat16(tile.data[1].y);
+                if (base_row + 0 < sorted_M_valid) intermediate[(base_row + 0) * total_n + col] = __float2bfloat16(tile.data[0].x);
+                if (base_row + 1 < sorted_M_valid) intermediate[(base_row + 1) * total_n + col] = __float2bfloat16(tile.data[0].y);
+                if (base_row + 2 < sorted_M_valid) intermediate[(base_row + 2) * total_n + col] = __float2bfloat16(tile.data[1].x);
+                if (base_row + 3 < sorted_M_valid) intermediate[(base_row + 3) * total_n + col] = __float2bfloat16(tile.data[1].y);
             }
         }
     }
@@ -310,11 +298,11 @@ void dispatch_hk_moe_stage1(const moe_stage1_globals& g) {
     const int num_m_blocks = (g.sorted_M + BLOCK_SIZE - 1) / BLOCK_SIZE;
     const int num_n_blocks = (total_n + BLOCK_SIZE - 1) / BLOCK_SIZE;
     
-    dim3 grid(num_m_blocks, num_n_blocks);
+    dim3 grid(num_n_blocks, num_m_blocks);
     dim3 block(NUM_THREADS);
     
     // Set dynamic shared memory size (match AITER's K_STEP=64)
-    size_t smem_size = 65536;  // 64KB for K_STEP=64
+    size_t smem_size = 32768;  // 32KB for K_STEP=32
     hipFuncSetAttribute((void*)hk_moe_stage1_kernel_mma, 
                         hipFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     
@@ -324,6 +312,7 @@ void dispatch_hk_moe_stage1(const moe_stage1_globals& g) {
         g.intermediate.raw_ptr,
         g.sorted_ids,
         g.sorted_expert_ids,
+        g.num_valid_ids,
         g.sorted_M,
         g.num_tokens,
         g.model_dim,
