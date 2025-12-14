@@ -65,6 +65,9 @@ void hk_moe_stage1_kernel_mma(
     // Allocate shared memory tiles
     s1_st_tile (&As) = al.allocate<s1_st_tile>();   // Input tile [BLOCK_SIZE, K_STEP]
     s1_st_tile (&Bs) = al.allocate<s1_st_tile>();   // Weight tile [BLOCK_SIZE, K_STEP]
+    // Precompute per-row base offsets into `hidden_states` for this 128-row tile.
+    // This avoids re-reading `sorted_ids[row]` and recomputing `token_id * model_dim` for every K tile.
+    int (&token_row_offsets)[BLOCK_SIZE] = al.allocate<int, BLOCK_SIZE>();
     
     const int total_n = inter_dim * 2;
     
@@ -107,6 +110,9 @@ void hk_moe_stage1_kernel_mma(
     const int expert_id = sorted_expert_ids[tile_id];
     
     if (expert_id < 0 || expert_id >= num_experts) return;
+
+    // Hoist expert weight base pointer (reduces repeated address arithmetic in the load loop).
+    const bf16* __restrict__ w1_expert = w1 + expert_id * total_n * model_dim;
     
     // Warp mapping: 8 warps arranged in a 2x4 grid
     // Warps 0-3 are row 0, warps 4-7 are row 1
@@ -118,6 +124,21 @@ void hk_moe_stage1_kernel_mma(
     
     const int lane = threadIdx.x;
     constexpr int VEC_SIZE = 8;  // bf16 elements per float4
+
+    // === Precompute token row base offsets (token_id * model_dim) into LDS ===
+    // token_row_offsets[m] is either a valid base offset (in bf16 elements) or -1 for invalid/padded rows.
+    if (lane < BLOCK_SIZE) {
+        const int row = row_start + lane;
+        int base = -1;
+        if (row < sorted_M_valid) {
+            const int packed_id = sorted_ids[row];
+            const int token_id = packed_id & 0xFFFFFF;
+            // NOTE: token_id should be valid for non-padded rows; keep a guard for safety.
+            if (token_id >= 0 && token_id < num_tokens) base = token_id * model_dim;
+        }
+        token_row_offsets[lane] = base;
+    }
+    __syncthreads();
     
     for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) {
         const int k_start = k_tile * K_STEP;
@@ -141,18 +162,13 @@ void hk_moe_stage1_kernel_mma(
             int m = vec_idx / VECS_PER_ROW;
             int k = (vec_idx % VECS_PER_ROW) * VEC_SIZE;
 
-            int row = row_start + m;
-
             // Each float4 is a raw 16B copy (8 bf16). We treat it as bits and store to LDS in two 8B chunks.
             float4 buf = {0.f, 0.f, 0.f, 0.f};
-            if (row < sorted_M_valid && (k_start + k + VEC_SIZE - 1) < model_dim) {
-                int packed_id = sorted_ids[row];
-                int token_id = packed_id & 0xFFFFFF;
-                if (token_id >= 0 && token_id < num_tokens) {
-                    buf = load_global_vec4(reinterpret_cast<const float4*>(
-                        &hidden_states[token_id * model_dim + k_start + k]
-                    ));
-                }
+            const int base = token_row_offsets[m];
+            if (base >= 0 && (k_start + k + VEC_SIZE - 1) < model_dim) {
+                buf = load_global_vec4(reinterpret_cast<const float4*>(
+                    &hidden_states[base + k_start + k]
+                ));
             }
 
             store_shared_vec(As.idx(As_ptr, {m, k}), {buf.x, buf.y});
@@ -177,7 +193,7 @@ void hk_moe_stage1_kernel_mma(
             float4 buf = {0.f, 0.f, 0.f, 0.f};
             if (col < total_n && (k_start + k + VEC_SIZE - 1) < model_dim) {
                 buf = load_global_vec4(reinterpret_cast<const float4*>(
-                    &w1[expert_id * total_n * model_dim + col * model_dim + k_start + k]
+                    &w1_expert[col * model_dim + k_start + k]
                 ));
             }
 
