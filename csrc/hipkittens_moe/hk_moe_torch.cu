@@ -6,9 +6,6 @@
 
 #include "hk_moe_kernel.cuh"
 
-#include <cstdlib>
-#include <cstdint>
-
 // G1U1 activation kernel
 template <int BLOCK_SIZE_ACT>
 __global__ void apply_g1u1_activation_kernel(
@@ -32,89 +29,6 @@ __global__ void apply_g1u1_activation_kernel(
         
         // Store in first half
         data[row * inter_dim * 2 + col] = __float2bfloat16(result);
-    }
-}
-
-// === Option B (partial): within-expert tile-local reorder by token_id ===
-// We keep expert segmentation intact by sorting *within each 128-row tile* (block_m==128).
-// This improves hidden_states gather locality without requiring a full segmented sort/merge.
-// The sort permutes `sorted_ids` and `sorted_weights` together, in-place.
-//
-// Enable with: HK_MOE_TILE_SORT_TOKEN=1
-constexpr int HK_TILE_SORT_M = 128;
-
-__global__ void hk_moe_tile_sort_by_token_kernel(
-    int32_t* __restrict__ sorted_ids,
-    float* __restrict__ sorted_weights,
-    const int sorted_M,
-    const int sorted_M_valid
-) {
-    __shared__ int32_t s_packed[HK_TILE_SORT_M];
-    __shared__ int32_t s_token[HK_TILE_SORT_M];
-    __shared__ float   s_w[HK_TILE_SORT_M];
-
-    const int lane = (int)threadIdx.x;
-    if (lane >= HK_TILE_SORT_M) return;
-
-    const int tile = (int)blockIdx.x;
-    const int base = tile * HK_TILE_SORT_M;
-    const int row  = base + lane;
-
-    int32_t packed = 0;
-    float w = 0.0f;
-    int32_t token_key = 0x7fffffff;
-
-    if (row < sorted_M) {
-        packed = sorted_ids[row];
-        w = sorted_weights[row];
-    }
-
-    // Only valid rows participate; invalid rows get a large key so they sink to the end.
-    if (row < sorted_M_valid) {
-        const int32_t token_id = packed & 0x00FFFFFF;
-        // token_id is expected in-range; treat negative/invalid as large key too.
-        token_key = (token_id >= 0) ? token_id : 0x7fffffff;
-    } else {
-        packed = 0;
-        w = 0.0f;
-        token_key = 0x7fffffff;
-    }
-
-    s_packed[lane] = packed;
-    s_w[lane]      = w;
-    s_token[lane]  = token_key;
-    __syncthreads();
-
-    // Bitonic sort on 128 keys (ascending).
-    // Only one thread per pair performs the swap to avoid races.
-    for (int k = 2; k <= HK_TILE_SORT_M; k <<= 1) {
-        for (int j = k >> 1; j > 0; j >>= 1) {
-            const int ixj = lane ^ j;
-            if (ixj > lane) {
-                const bool up = ((lane & k) == 0);
-                const int32_t a = s_token[lane];
-                const int32_t b = s_token[ixj];
-                const bool swap = up ? (a > b) : (a < b);
-                if (swap) {
-                    const int32_t tp = s_packed[lane];
-                    const float   tw = s_w[lane];
-                    const int32_t tk = s_token[lane];
-                    s_packed[lane] = s_packed[ixj];
-                    s_w[lane]      = s_w[ixj];
-                    s_token[lane]  = s_token[ixj];
-                    s_packed[ixj] = tp;
-                    s_w[ixj]      = tw;
-                    s_token[ixj]  = tk;
-                }
-            }
-            __syncthreads();
-        }
-    }
-
-    // Write back in-place.
-    if (row < sorted_M) {
-        sorted_ids[row] = s_packed[lane];
-        sorted_weights[row] = s_w[lane];
     }
 }
 
@@ -155,22 +69,6 @@ torch::Tensor hk_fused_moe_fwd(
     torch::Tensor output = torch::zeros({num_tokens, model_dim}, options);
     
     hipStream_t stream = at::hip::getCurrentHIPStream();
-
-    // Optional: tile-local within-expert reorder by token_id to improve gather coalescing.
-    // This is a partial implementation of Option B (segmented sort) that avoids cross-tile merges.
-    if (const char* env = std::getenv("HK_MOE_TILE_SORT_TOKEN")) {
-        if (std::atoi(env) != 0) {
-            // sorted_M_valid is num_valid_ids[0] (stored by moe_sorting), i.e. count of non-padded rows.
-            const int sorted_M_valid = num_valid_ids.data_ptr<int32_t>()[0];
-            const int num_tiles = (sorted_M + HK_TILE_SORT_M - 1) / HK_TILE_SORT_M;
-            hk_moe_tile_sort_by_token_kernel<<<dim3(num_tiles), dim3(HK_TILE_SORT_M), 0, stream>>>(
-                sorted_ids.data_ptr<int32_t>(),
-                sorted_weights.data_ptr<float>(),
-                sorted_M,
-                sorted_M_valid
-            );
-        }
-    }
     
     // Stage 1: Gate-Up projection
     {
