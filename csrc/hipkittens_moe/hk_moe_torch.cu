@@ -115,12 +115,12 @@ torch::Tensor hk_fused_moe_fwd(
     }
     
     // Synchronize to ensure activation completes before slicing
-    hipStreamSynchronize(stream);
+    // hipStreamSynchronize(stream); // Removed: Stage2 is enqueued on the same stream
     
     // Stage 2: Down projection with weighted accumulation
     {
         // Slice intermediate to just the activated part (first half)
-        torch::Tensor activated = intermediate.slice(1, 0, inter_dim).contiguous();
+        // torch::Tensor activated = intermediate.slice(1, 0, inter_dim).contiguous(); // Removed: Stage2 reads strided
         
         // Allocate fp32 buffer for atomic adds
         torch::Tensor output_fp32 = torch::zeros({num_tokens, model_dim}, 
@@ -128,8 +128,8 @@ torch::Tensor hk_fused_moe_fwd(
         
         moe_stage2_globals g2 = {
             .intermediate = make_gl_4d(
-                reinterpret_cast<bf16*>(activated.data_ptr()),
-                (size_t)1, (size_t)1, (size_t)sorted_M, (size_t)inter_dim
+                reinterpret_cast<bf16*>(intermediate.data_ptr()),
+                (size_t)1, (size_t)1, (size_t)sorted_M, (size_t)(inter_dim * 2)
             ),
             .w2 = make_gl_4d(
                 reinterpret_cast<bf16*>(w2.data_ptr()),
@@ -147,6 +147,7 @@ torch::Tensor hk_fused_moe_fwd(
             .num_tokens = num_tokens,
             .model_dim = model_dim,
             .inter_dim = inter_dim,
+            .inter_row_stride = inter_dim * 2,
             .num_experts = num_experts,
             .topk = topk,
             .block_m = block_m,

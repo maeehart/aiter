@@ -137,6 +137,15 @@ def hipkittens_fused_moe(
     # Auto-select block size based on batch size
     if block_size_M is None:
         block_size_M = get_hipkittens_block_m(M)
+
+    # Correctness requirement (current HipKittens kernels):
+    # The kernels use a fixed 128-row tile internally and compute
+    # `tile_id = row_start / block_m` to look up `sorted_expert_ids[tile_id]`.
+    # If block_m != 128, a single kernel tile can span multiple sorting tiles
+    # and the kernel will apply the wrong expert weights for part of the tile.
+    # Until the kernels are updated to handle block_m != 128, force block_m=128.
+    if block_size_M != 128:
+        block_size_M = 128
     
     # Determine global expert count for EP
     global_E = E

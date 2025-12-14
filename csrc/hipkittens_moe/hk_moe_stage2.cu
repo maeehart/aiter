@@ -49,6 +49,7 @@ void hk_moe_stage2_kernel_mma(
     const int num_tokens,
     const int model_dim,
     const int inter_dim,
+    const int inter_row_stride,
     const int num_experts,
     const int topk,
     const int block_m_sorting,
@@ -128,7 +129,7 @@ void hk_moe_stage2_kernel_mma(
             float4 buf = {0.f, 0.f, 0.f, 0.f};
             if (row < sorted_M_valid && (k_start + k + VEC_SIZE - 1) < inter_dim) {
                 buf = load_global_vec4(reinterpret_cast<const float4*>(
-                    &intermediate[row * inter_dim + k_start + k]
+                    &intermediate[row * inter_row_stride + k_start + k]
                 ));
             }
             store_shared_vec(As.idx(As_ptr, {m, k}), {buf.x, buf.y});
@@ -272,6 +273,7 @@ void dispatch_hk_moe_stage2(const moe_stage2_globals& g, float* output_fp32) {
         g.num_tokens,
         g.model_dim,
         g.inter_dim,
+        g.inter_row_stride,
         g.num_experts,
         g.topk,
         g.block_m,

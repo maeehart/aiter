@@ -46,6 +46,11 @@ The MoE computation is split into three stages:
    - Halved shared memory: 64KB → 32KB per block
    - Enables 2 concurrent blocks per CU (was 1)
    - ~20% additional speedup
+6. **Strided Stage2 input (remove activation contiguous copy)**
+   - Stage 2 reads the activated first-half view from the Stage1 output buffer using a row stride
+   - Removes `hipStreamSynchronize` and `activated = intermediate.slice(...).contiguous()`
+   - Avoids an extra device-to-device copy for long context lengths
+
 
 5. **Tiled Computation**
    - BLOCK_SIZE=128, K_STEP=32 per HipKittens GEMM pattern
@@ -66,13 +71,16 @@ The MoE computation is split into three stages:
 
 ## Current Performance
 
-Tested on MI300X with model_dim=4096, inter_dim=4096, 8 experts, topk=2:
+Tested on MI300X with model_dim=4096, inter_dim=4096, 8 experts, topk=2 using `python op_tests/test_hipkittens_moe.py --quick` (Dec 14, 2025).
+
+
+**Correctness**: PASS vs PyTorch reference for all `--quick` batch sizes (1024/4096/8192).
 
 | Batch | AITER (TFLOPs) | HipKittens (TFLOPs) | Speedup |
 |-------|----------------|---------------------|---------|
-| 1024  | ~633           | ~216                | 0.46x   |
-| 4096  | ~469           | ~216                | 0.46x   |
-| 8192  | ~557           | ~225                | 0.40x   |
+| 1024  | 404.25         | 187.32              | 0.46x   |
+| 4096  | 487.40         | 259.17              | 0.53x   |
+| 8192  | 558.58         | 276.67              | 0.50x   |
 
 ### Detailed Profiling Analysis (rocprof)
 

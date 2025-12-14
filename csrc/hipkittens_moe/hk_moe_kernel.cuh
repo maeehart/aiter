@@ -76,6 +76,10 @@ struct moe_stage2_globals {
     int num_tokens;
     int model_dim;
     int inter_dim;
+    // Row stride (in elements) of the stage2 `intermediate` pointer. This lets Stage2 read the
+    // activated first-half view from the Stage1 output buffer ([sorted_M, inter_dim*2])
+    // without materializing `activated = intermediate.slice(...).contiguous()`.
+    int inter_row_stride;
     int num_experts;
     int topk;
     int block_m;                // Block size from sorting, used for sorted_expert_ids indexing
