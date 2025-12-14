@@ -39,6 +39,18 @@ using s1_st_tile = st_bf<s1_cfg::BLOCK_SIZE, s1_cfg::K_STEP>;  // [128, 64] shar
 // Group for cooperative loading
 using s1_group = group<s1_cfg::NUM_WARPS>;
 
+// === AMD buffer-load helper (enables pipelined global->register prefetch) ===
+// We use raw buffer loads so we can overlap the next K-tile weight fetch with MFMA on the current tile.
+// The returned float4 is treated as raw 16B bits (8xbf16) and stored to LDS via store_shared_vec().
+using i32x4_t = int __attribute__((ext_vector_type(4)));
+__device__ __forceinline__ float4 raw_buffer_load_b128_to_float4(const __amdgpu_buffer_rsrc_t& rsrc,
+                                                                 const int byte_offset)
+{
+    const i32x4_t v = __builtin_amdgcn_raw_buffer_load_b128(rsrc, byte_offset, 0, 0);
+    return __builtin_bit_cast(float4, v);
+}
+
+
 __global__ __launch_bounds__(s1_cfg::NUM_THREADS, 2)
 void hk_moe_stage1_kernel_mma(
     const bf16* __restrict__ hidden_states,  // [num_tokens, model_dim]
@@ -64,10 +76,16 @@ void hk_moe_stage1_kernel_mma(
     
     // Allocate shared memory tiles
     s1_st_tile (&As) = al.allocate<s1_st_tile>();   // Input tile [BLOCK_SIZE, K_STEP]
-    s1_st_tile (&Bs) = al.allocate<s1_st_tile>();   // Weight tile [BLOCK_SIZE, K_STEP]
+    // Double-buffered weight tiles (Bs0/Bs1): enables overlap of global weight loads with MFMA.
+    s1_st_tile (&Bs0) = al.allocate<s1_st_tile>();  // Weight tile for even k_tile
+    s1_st_tile (&Bs1) = al.allocate<s1_st_tile>();  // Weight tile for odd  k_tile
     // Precompute per-row base offsets into `hidden_states` for this 128-row tile.
     // This avoids re-reading `sorted_ids[row]` and recomputing `token_id * model_dim` for every K tile.
     int (&token_row_offsets)[BLOCK_SIZE] = al.allocate<int, BLOCK_SIZE>();
+    // Hoist shared-tile base pointers (reduces per-iteration address arithmetic).
+    const uint32_t As_ptr  = reinterpret_cast<uintptr_t>(&As.data[0]);
+    const uint32_t Bs0_ptr = reinterpret_cast<uintptr_t>(&Bs0.data[0]);
+    const uint32_t Bs1_ptr = reinterpret_cast<uintptr_t>(&Bs1.data[0]);
     
     const int total_n = inter_dim * 2;
     
@@ -113,6 +131,9 @@ void hk_moe_stage1_kernel_mma(
 
     // Hoist expert weight base pointer (reduces repeated address arithmetic in the load loop).
     const bf16* __restrict__ w1_expert = w1 + expert_id * total_n * model_dim;
+    // Buffer resource for raw buffer loads (byte addressing).
+    const __amdgpu_buffer_rsrc_t w1_rsrc =
+        __builtin_amdgcn_make_buffer_rsrc(const_cast<bf16*>(w1_expert), 0, 0xffffffff, 0x00020000);
     
     // Warp mapping: 8 warps arranged in a 2x4 grid
     // Warps 0-3 are row 0, warps 4-7 are row 1
@@ -139,9 +160,42 @@ void hk_moe_stage1_kernel_mma(
         token_row_offsets[lane] = base;
     }
     __syncthreads();
-    
+
+    // === Preload first weight K-tile (k_tile = 0) into Bs0 ===
+    // For subsequent tiles, we prefetch the next weights into registers during MFMA and then commit to the
+    // alternate Bs buffer at the end of the iteration.
+    {
+        constexpr int VEC_SIZE_W = 8;  // bf16 elements per 16B vector
+        constexpr int TOTAL_VECS_W = (BLOCK_SIZE * K_STEP) / VEC_SIZE_W;
+        constexpr int VECS_PER_THREAD_W = TOTAL_VECS_W / NUM_THREADS;
+
+        #pragma unroll
+        for (int v = 0; v < VECS_PER_THREAD_W; v++) {
+            int vec_idx = lane * VECS_PER_THREAD_W + v;
+            int flat_idx = vec_idx * VEC_SIZE_W;
+            int n = flat_idx / K_STEP;
+            int k = flat_idx % K_STEP;
+
+            int col = col_start + n;
+            float4 buf = {0.f, 0.f, 0.f, 0.f};
+            if (col < total_n && (k + VEC_SIZE_W - 1) < model_dim) {
+                const int elem_off = col * model_dim + k;
+                const int byte_off = elem_off * (int)sizeof(bf16);
+                buf = raw_buffer_load_b128_to_float4(w1_rsrc, byte_off);
+            }
+
+            store_shared_vec(Bs0.idx(Bs0_ptr, {n, k}), {buf.x, buf.y});
+            store_shared_vec(Bs0.idx(Bs0_ptr, {n, k + 4}), {buf.z, buf.w});
+        }
+    }
+
+    __syncthreads();
+
     for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) {
         const int k_start = k_tile * K_STEP;
+        // Select current weight buffer.
+        s1_st_tile& Bs_cur = (k_tile & 1) ? Bs1 : Bs0;
+        const uint32_t Bs_cur_ptr = (k_tile & 1) ? Bs1_ptr : Bs0_ptr;
         
         // === Cooperative vectorized load input tile with gather via sorted_ids ===
         // For gather: we load K values per row with vectorization
@@ -156,8 +210,6 @@ void hk_moe_stage1_kernel_mma(
             // IMPORTANT: st_bf tiles use a swizzled shared-memory layout. Writing via
             // `As[{m,k}] = ...` bypasses the expected vectorized LDS stores and can corrupt the tile.
             // Use HipKittens' `store_shared_vec` + `tile.idx(...)` path, same as `global_to_shared.cuh`.
-            uint32_t As_ptr = reinterpret_cast<uintptr_t>(&As.data[0]);
-
             int vec_idx = lane * VECS_PER_THREAD + v;
             int m = vec_idx / VECS_PER_ROW;
             int k = (vec_idx % VECS_PER_ROW) * VEC_SIZE;
@@ -175,33 +227,32 @@ void hk_moe_stage1_kernel_mma(
             store_shared_vec(As.idx(As_ptr, {m, k + 4}), {buf.z, buf.w});
         }
 
-// === Cooperative vectorized load weight tile (contiguous) ===
+        // Barrier: ensure As is ready; Bs_cur is already resident (preloaded or committed by previous iter).
+        __syncthreads();
+
+        // === Prefetch next weight K-tile (w1 only) into registers while we MFMA on the current tile ===
         constexpr int TOTAL_VECS_W = (BLOCK_SIZE * K_STEP) / VEC_SIZE;
         constexpr int VECS_PER_THREAD_W = TOTAL_VECS_W / NUM_THREADS;
-        
-        #pragma unroll
-        for (int v = 0; v < VECS_PER_THREAD_W; v++) {
-            uint32_t Bs_ptr = reinterpret_cast<uintptr_t>(&Bs.data[0]);
-
-            int vec_idx = lane * VECS_PER_THREAD_W + v;
-            int flat_idx = vec_idx * VEC_SIZE;
-            int n = flat_idx / K_STEP;
-            int k = flat_idx % K_STEP;
-
-            int col = col_start + n;
-
-            float4 buf = {0.f, 0.f, 0.f, 0.f};
-            if (col < total_n && (k_start + k + VEC_SIZE - 1) < model_dim) {
-                buf = load_global_vec4(reinterpret_cast<const float4*>(
-                    &w1_expert[col * model_dim + k_start + k]
-                ));
+        float4 w1_prefetch[VECS_PER_THREAD_W];
+        if (k_tile + 1 < num_k_tiles) {
+            const int k_start_next = (k_tile + 1) * K_STEP;
+            #pragma unroll
+            for (int v = 0; v < VECS_PER_THREAD_W; v++) {
+                int vec_idx = lane * VECS_PER_THREAD_W + v;
+                int flat_idx = vec_idx * VEC_SIZE;
+                int n = flat_idx / K_STEP;
+                int k = flat_idx % K_STEP;
+                int col = col_start + n;
+                float4 buf = {0.f, 0.f, 0.f, 0.f};
+                if (col < total_n && (k_start_next + k + VEC_SIZE - 1) < model_dim) {
+                    const int elem_off = col * model_dim + k_start_next + k;
+                    const int byte_off = elem_off * (int)sizeof(bf16);
+                    buf = raw_buffer_load_b128_to_float4(w1_rsrc, byte_off);
+                }
+                w1_prefetch[v] = buf;
             }
-
-            store_shared_vec(Bs.idx(Bs_ptr, {n, k}), {buf.x, buf.y});
-            store_shared_vec(Bs.idx(Bs_ptr, {n, k + 4}), {buf.z, buf.w});
         }
 
-__syncthreads();
         
         // === Compute MMA for this K tile ===
         // Process K_STEP in DOT_SLICE (16) chunks
@@ -221,7 +272,7 @@ __syncthreads();
             // Load A subtile for first 32 rows
             load(a_tile, subtile_inplace<REG_BLOCK, DOT_SLICE>(As, {warp_row, kk}));
             // Load B subtile 
-            load(b_tile, subtile_inplace<REG_BLOCK, DOT_SLICE>(Bs, {warp_col, kk}));
+            load(b_tile, subtile_inplace<REG_BLOCK, DOT_SLICE>(Bs_cur, {warp_col, kk}));
             
             __builtin_amdgcn_sched_barrier(0);
             asm volatile("s_waitcnt lgkmcnt(0)");
@@ -248,6 +299,27 @@ __syncthreads();
         }
         
         __syncthreads();
+
+        // Commit prefetched weights into the alternate Bs buffer for the next iteration.
+        if (k_tile + 1 < num_k_tiles) {
+            s1_st_tile& Bs_next = (k_tile & 1) ? Bs0 : Bs1;
+            const uint32_t Bs_next_ptr = (k_tile & 1) ? Bs0_ptr : Bs1_ptr;
+
+            // Ensure the prefetch loads are complete before writing to LDS.
+            asm volatile("s_waitcnt vmcnt(0)");
+
+            #pragma unroll
+            for (int v = 0; v < VECS_PER_THREAD_W; v++) {
+                int vec_idx = lane * VECS_PER_THREAD_W + v;
+                int flat_idx = vec_idx * VEC_SIZE;
+                int n = flat_idx / K_STEP;
+                int k = flat_idx % K_STEP;
+
+                const float4 buf = w1_prefetch[v];
+                store_shared_vec(Bs_next.idx(Bs_next_ptr, {n, k}), {buf.x, buf.y});
+                store_shared_vec(Bs_next.idx(Bs_next_ptr, {n, k + 4}), {buf.z, buf.w});
+            }
+        }
     }
     
     // === Store results ===
@@ -318,7 +390,8 @@ void dispatch_hk_moe_stage1(const moe_stage1_globals& g) {
     dim3 block(NUM_THREADS);
     
     // Set dynamic shared memory size (match AITER's K_STEP=64)
-    size_t smem_size = 32768;  // 32KB for K_STEP=32
+    // Dynamic shared memory: As + 2*Bs (double-buffer) + token_row_offsets (+ a little padding).
+    size_t smem_size = sizeof(s1_st_tile) * 3 + sizeof(int) * BLOCK_SIZE + 256;
     hipFuncSetAttribute((void*)hk_moe_stage1_kernel_mma, 
                         hipFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     

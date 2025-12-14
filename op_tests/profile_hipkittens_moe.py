@@ -1,97 +1,71 @@
 #!/usr/bin/env python3
-"""
-Profile HipKittens MoE kernels using rocprof.
+"""Profile HipKittens MoE kernels using rocprofv3.
 
-Usage:
-    # Basic profiling with counters
-    rocprofv3 --stats python profile_hipkittens_moe.py
-    
-    # Advanced Thread Tracing (for rocprof-compute-viewer)
-    rocprofv3 --att --att-kernel "hk_moe" python profile_hipkittens_moe.py
-    
-    # With activity summary  
-    rocprofv3 --att-activity 10 --att-kernel "hk_moe" python profile_hipkittens_moe.py
-    
-    # Hardware counters for MMA utilization
-    rocprofv3 --pmc "SQ_VALU_MFMA_BUSY_CYCLES,SQ_INSTS_MFMA,SQ_INSTS_VALU,SQ_BUSY_CU_CYCLES" python profile_hipkittens_moe.py
+This script is intended to be run under rocprofv3 for traces/PMCs.
+We intentionally do NOT compute a full PyTorch reference here (too slow and pollutes profiles).
+
+Example:
+  rocprofv3 --pmc "SQ_INSTS_MFMA,SQ_INSTS_VALU,SQ_BUSY_CU_CYCLES" -- \
+    python op_tests/profile_hipkittens_moe.py --batch-size 8192 --warmup 3 --iters 10
 """
+
+import argparse
+import os
+import sys
 
 import torch
-import sys
-import os
 
-# Add parent to path
+# Add repo root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from aiter.fused_moe import fused_topk
 from aiter.hipkittens_moe import hipkittens_fused_moe
 from aiter import ActivationType
 
-def profile_hipkittens():
-    """Run HipKittens MoE kernel for profiling."""
-    
-    # Use a reasonable batch size
-    batch_size = 4096
+
+def main(batch_size: int, warmup: int, iters: int, seed: int) -> None:
     model_dim = 4096
     inter_dim = 4096
     num_experts = 8
     topk = 2
-    
-    print(f"Profiling HipKittens MoE:")
+
+    print("Profiling HipKittens MoE:")
     print(f"  batch_size={batch_size}")
     print(f"  model_dim={model_dim}")
     print(f"  inter_dim={inter_dim}")
     print(f"  num_experts={num_experts}")
     print(f"  topk={topk}")
-    
-    # Create test tensors
-    torch.manual_seed(42)
-    hidden = torch.randn(batch_size, model_dim, dtype=torch.bfloat16, device='cuda')
-    w1 = torch.randn(num_experts, inter_dim * 2, model_dim, dtype=torch.bfloat16, device='cuda')
-    w2 = torch.randn(num_experts, model_dim, inter_dim, dtype=torch.bfloat16, device='cuda')
-    scores = torch.randn(batch_size, num_experts, dtype=torch.float32, device='cuda')
-    
-    # Get topk routing
+
+    torch.manual_seed(seed)
+    hidden = torch.randn((batch_size, model_dim), dtype=torch.bfloat16, device="cuda")
+    w1 = torch.randn((num_experts, inter_dim * 2, model_dim), dtype=torch.bfloat16, device="cuda")
+    w2 = torch.randn((num_experts, model_dim, inter_dim), dtype=torch.bfloat16, device="cuda")
+    scores = torch.randn((batch_size, num_experts), dtype=torch.float32, device="cuda")
+
     topk_w, topk_ids = fused_topk(hidden, scores, topk, True)
-    
-    # Warmup
+
     print("Warming up...")
-    for _ in range(3):
-        out = hipkittens_fused_moe(hidden, w1, w2, topk_w, topk_ids, activation=ActivationType.Silu)
+    for _ in range(warmup):
+        _ = hipkittens_fused_moe(hidden, w1, w2, topk_w, topk_ids, activation=ActivationType.Silu)
         torch.cuda.synchronize()
-    
-    # Profile runs
-    num_runs = 10
-    print(f"Running {num_runs} iterations for profiling...")
-    
+
+    print(f"Running {iters} iterations for profiling...")
     torch.cuda.synchronize()
-    
-    for i in range(num_runs):
+
+    for _ in range(iters):
         out = hipkittens_fused_moe(hidden, w1, w2, topk_w, topk_ids, activation=ActivationType.Silu)
-    
+
     torch.cuda.synchronize()
-    
     print("Profiling complete!")
-    print(f"Output shape: {out.shape}")
-    
-    # Verify correctness
-    print("Verifying correctness...")
-    expected = torch.zeros_like(hidden)
-    for b in range(batch_size):
-        for k in range(topk):
-            expert_id = topk_ids[b, k].item()
-            weight = topk_w[b, k].item()
-            x = hidden[b:b+1]
-            gate_up = x @ w1[expert_id].T
-            gate = gate_up[:, :inter_dim]
-            up = gate_up[:, inter_dim:]
-            activated = torch.nn.functional.silu(gate) * up
-            down = activated @ w2[expert_id].T
-            expected[b] += weight * down.squeeze(0)
-    
-    diff = (out.float() - expected.float()).abs().max().item()
-    print(f"Max abs diff vs reference: {diff}")
+    print(f"Output shape: {tuple(out.shape)}")
+
 
 if __name__ == "__main__":
-    profile_hipkittens()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--batch-size", type=int, default=8192)
+    ap.add_argument("--warmup", type=int, default=3)
+    ap.add_argument("--iters", type=int, default=10)
+    ap.add_argument("--seed", type=int, default=42)
+    args = ap.parse_args()
 
+    main(batch_size=args.batch_size, warmup=args.warmup, iters=args.iters, seed=args.seed)
