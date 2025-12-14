@@ -171,10 +171,9 @@ void hk_moe_stage1_kernel_mma(
 
         #pragma unroll
         for (int v = 0; v < VECS_PER_THREAD_W; v++) {
-            int vec_idx = lane * VECS_PER_THREAD_W + v;
-            int flat_idx = vec_idx * VEC_SIZE_W;
-            int n = flat_idx / K_STEP;
-            int k = flat_idx % K_STEP;
+            (void)v;
+            const int n = (lane >> 2);              // lane/4
+            const int k = (lane & 3) << 3;          // (lane%4)*8
 
             int col = col_start + n;
             float4 buf = {0.f, 0.f, 0.f, 0.f};
@@ -238,11 +237,10 @@ void hk_moe_stage1_kernel_mma(
             const int k_start_next = (k_tile + 1) * K_STEP;
             #pragma unroll
             for (int v = 0; v < VECS_PER_THREAD_W; v++) {
-                int vec_idx = lane * VECS_PER_THREAD_W + v;
-                int flat_idx = vec_idx * VEC_SIZE;
-                int n = flat_idx / K_STEP;
-                int k = flat_idx % K_STEP;
-                int col = col_start + n;
+                (void)v;
+                const int n = (lane >> 2);
+                const int k = (lane & 3) << 3;
+                const int col = col_start + n;
                 float4 buf = {0.f, 0.f, 0.f, 0.f};
                 if (col < total_n && (k_start_next + k + VEC_SIZE - 1) < model_dim) {
                     const int elem_off = col * model_dim + k_start_next + k;
@@ -310,10 +308,9 @@ void hk_moe_stage1_kernel_mma(
 
             #pragma unroll
             for (int v = 0; v < VECS_PER_THREAD_W; v++) {
-                int vec_idx = lane * VECS_PER_THREAD_W + v;
-                int flat_idx = vec_idx * VEC_SIZE;
-                int n = flat_idx / K_STEP;
-                int k = flat_idx % K_STEP;
+                (void)v;
+                const int n = (lane >> 2);
+                const int k = (lane & 3) << 3;
 
                 const float4 buf = w1_prefetch[v];
                 store_shared_vec(Bs_next.idx(Bs_next_ptr, {n, k}), {buf.x, buf.y});
