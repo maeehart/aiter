@@ -555,7 +555,501 @@ void hk_moe_fused_fp8_kernel(
 
 
 // ============================================================================
-// Dispatch Function
+// STREAMING FUSION KERNEL
+// ============================================================================
+// Key insight: Process inter_dim in chunks, keeping intermediate in registers.
+// For each inter_k chunk:
+//   1. Compute partial intermediate by iterating over model_dim
+//   2. Apply SiLU immediately
+//   3. Multiply by W2 chunk and accumulate to output
+// Output accumulator stays in registers throughout - no LDS for intermediate!
+
+namespace stream_cfg {
+    constexpr int M_TILE = 32;         // Rows per workgroup  
+    constexpr int N_TILE = 128;        // Output columns per workgroup
+    constexpr int K_STEP = 32;         // K dimension per iteration (for model_dim)
+    constexpr int K_INTER = 32;        // Inter_dim chunk size (K of Stage 2)
+    
+    constexpr int REG_M = 16;          // Each warp handles 16 rows
+    constexpr int REG_N = 64;          // Each warp handles 64 output columns
+    constexpr int DOT_SLICE = 16;      // MFMA native dimension
+    
+    constexpr int NUM_WARPS = 4;
+    constexpr int NUM_THREADS = WARP_THREADS * NUM_WARPS;  // 256
+    
+    constexpr int NUM_XCDS = 8;
+    constexpr int WGM = 4;
+}
+
+// Shared tiles for streaming kernel
+using stream_input_tile = st_bf<stream_cfg::M_TILE, stream_cfg::K_STEP>;      // [32, 32]
+using stream_w1_tile = st_bf<stream_cfg::K_INTER, stream_cfg::K_STEP>;        // [32, 32] for W1 slice
+using stream_w2_tile = st_bf<stream_cfg::N_TILE, stream_cfg::K_INTER>;        // [128, 32] for W2 slice
+
+__global__ __launch_bounds__(stream_cfg::NUM_THREADS, 2)
+void hk_moe_streaming_fp8_kernel(
+    const bf16* __restrict__ hidden_states,
+    const fp8_t* __restrict__ w1_fp8,
+    const fp8_t* __restrict__ w2_fp8,
+    const float* __restrict__ w1_scale,
+    const float* __restrict__ w2_scale,
+    float* __restrict__ output_fp32,
+    const int32_t* __restrict__ sorted_ids,
+    const int32_t* __restrict__ sorted_expert_ids,
+    const int32_t* __restrict__ num_valid_ids,
+    const float* __restrict__ sorted_weights,
+    const int sorted_M,
+    const int num_tokens,
+    const int model_dim,
+    const int inter_dim,
+    const int num_experts,
+    const int block_m_sorting,
+    const int num_m_blocks,
+    const int num_n_blocks,
+    const int num_scale_n_w1,
+    const int num_scale_k_w1,
+    const int num_scale_n_w2,
+    const int num_scale_k_w2
+) {
+    using namespace stream_cfg;
+    using namespace fp8_cfg;
+    
+    const int sorted_M_valid = num_valid_ids[0];
+    
+    extern __shared__ alignment_dummy __shm[];
+    shared_allocator al((int*)&__shm[0]);
+    
+    // LDS tiles - no intermediate buffer needed!
+    stream_input_tile (&As) = al.allocate<stream_input_tile>();    // [32, 32] for hidden
+    stream_w1_tile (&W1s) = al.allocate<stream_w1_tile>();         // [32, 32] for W1 slice
+    stream_w2_tile (&W2s) = al.allocate<stream_w2_tile>();         // [128, 32] for W2 slice
+    int* token_row_offsets = (int*)al.allocate<int[M_TILE]>();
+    
+    // Workgroup position
+    int wgid = (blockIdx.y * gridDim.x) + blockIdx.x;
+    const int NUM_WGS = gridDim.x * gridDim.y;
+    wgid = fused_xcd_transform(wgid, NUM_WGS);
+    if (wgid >= NUM_WGS) return;
+    
+    const int pid_m = wgid / num_n_blocks;
+    const int pid_n = wgid % num_n_blocks;
+    if (pid_m >= num_m_blocks || pid_n >= num_n_blocks) return;
+    
+    const int row_start = pid_m * M_TILE;
+    const int col_start = pid_n * N_TILE;  // Output column start
+    if (row_start >= sorted_M_valid || col_start >= model_dim) return;
+    
+    const int tile_id = row_start / block_m_sorting;
+    const int expert_id = sorted_expert_ids[tile_id];
+    if (expert_id < 0 || expert_id >= num_experts) return;
+    
+    // Expert weight pointers
+    const fp8_t* w1_expert = w1_fp8 + expert_id * (size_t)(inter_dim * 2) * model_dim;
+    const float* w1_expert_scale = w1_scale + expert_id * (size_t)num_scale_n_w1 * num_scale_k_w1;
+    const fp8_t* w2_expert = w2_fp8 + expert_id * (size_t)model_dim * inter_dim;
+    const float* w2_expert_scale = w2_scale + expert_id * (size_t)num_scale_n_w2 * num_scale_k_w2;
+    
+    const int warp_id = warpid();
+    const int lane = threadIdx.x;
+    const int lane_in_warp = lane % WARP_THREADS;
+    
+    // Warp mapping: 2×2 for [32, 128] output
+    const int warp_row_idx = warp_id / 2;      // 0 or 1
+    const int warp_col_idx = warp_id % 2;      // 0 or 1
+    const int warp_row_base = warp_row_idx * REG_M;   // 0 or 16
+    const int warp_col_base = warp_col_idx * REG_N;   // 0 or 64
+    
+    // Precompute token offsets
+    for (int i = lane; i < M_TILE; i += NUM_THREADS) {
+        int row = row_start + i;
+        int base = -1;
+        if (row < sorted_M_valid) {
+            int packed_id = sorted_ids[row];
+            int token_id = packed_id & 0xFFFFFF;
+            if (token_id >= 0 && token_id < num_tokens) {
+                base = token_id * model_dim;
+            }
+        }
+        token_row_offsets[i] = base;
+    }
+    __syncthreads();
+    
+    // Output accumulators - stay in registers throughout!
+    constexpr int OUT_SUBTILES = REG_N / DOT_SLICE;  // 4
+    rt_fl<REG_M, DOT_SLICE, ducks::rt_layout::col> C_out[OUT_SUBTILES];
+    #pragma unroll
+    for (int i = 0; i < OUT_SUBTILES; i++) {
+        zero(C_out[i]);
+    }
+    
+    // ==========================================================================
+    // MAIN LOOP: Iterate over inter_dim in K_INTER chunks
+    // ==========================================================================
+    const int num_inter_chunks = (inter_dim + K_INTER - 1) / K_INTER;
+    
+    for (int inter_chunk = 0; inter_chunk < num_inter_chunks; inter_chunk++) {
+        const int inter_k_start = inter_chunk * K_INTER;  // Start of this inter_dim slice
+        
+        // ------------------------------------------------------------------
+        // STAGE 1: Compute partial intermediate [M_TILE, K_INTER]
+        // ------------------------------------------------------------------
+        // inter[:, inter_k_start:inter_k_start+K_INTER] = 
+        //   silu(hidden × W1_gate[inter_k_start:...]^T) * (hidden × W1_up[inter_k_start:...]^T)
+        
+        // Intermediate accumulators for this chunk
+        constexpr int INTER_SUBTILES = K_INTER / DOT_SLICE;  // 2 for K_INTER=32
+        rt_fl<REG_M, DOT_SLICE, ducks::rt_layout::col> C_gate[INTER_SUBTILES];
+        rt_fl<REG_M, DOT_SLICE, ducks::rt_layout::col> C_up[INTER_SUBTILES];
+        #pragma unroll
+        for (int i = 0; i < INTER_SUBTILES; i++) {
+            zero(C_gate[i]);
+            zero(C_up[i]);
+        }
+        
+        // Inner K-loop over model_dim
+        const int num_k1_tiles = (model_dim + K_STEP - 1) / K_STEP;
+        
+        for (int k1_tile = 0; k1_tile < num_k1_tiles; k1_tile++) {
+            const int k1_start = k1_tile * K_STEP;
+            
+            // Load hidden tile [32, 32]
+            uint32_t As_ptr = reinterpret_cast<uintptr_t>(&As.data[0]);
+            constexpr int VEC_SIZE = 8;
+            constexpr int VECS_PER_ROW = K_STEP / VEC_SIZE;
+            constexpr int TOTAL_VECS_IN = M_TILE * VECS_PER_ROW;
+            
+            #pragma unroll
+            for (int v = 0; v < (TOTAL_VECS_IN + NUM_THREADS - 1) / NUM_THREADS; v++) {
+                int vec_idx = lane + v * NUM_THREADS;
+                if (vec_idx < TOTAL_VECS_IN) {
+                    int m = vec_idx / VECS_PER_ROW;
+                    int k = (vec_idx % VECS_PER_ROW) * VEC_SIZE;
+                    
+                    float4 buf = {0.f, 0.f, 0.f, 0.f};
+                    int base = token_row_offsets[m];
+                    if (base >= 0 && (k1_start + k + VEC_SIZE - 1) < model_dim) {
+                        buf = *reinterpret_cast<const float4*>(&hidden_states[base + k1_start + k]);
+                    }
+                    store_shared_vec(As.idx(As_ptr, {m, k}), {buf.x, buf.y});
+                    store_shared_vec(As.idx(As_ptr, {m, k + 4}), {buf.z, buf.w});
+                }
+            }
+            
+            // Load W1_gate tile [K_INTER, K_STEP] with FP8 dequant
+            uint32_t W1s_ptr = reinterpret_cast<uintptr_t>(&W1s.data[0]);
+            constexpr int TOTAL_VECS_W1 = K_INTER * K_STEP / VEC_SIZE;
+            
+            int k_block = k1_start / SCALE_BLOCK_K;
+            int n_block_gate = inter_k_start / SCALE_BLOCK_N;
+            float scale_gate = w1_expert_scale[n_block_gate * num_scale_k_w1 + k_block];
+            
+            #pragma unroll
+            for (int v = 0; v < (TOTAL_VECS_W1 + NUM_THREADS - 1) / NUM_THREADS; v++) {
+                int vec_idx = lane + v * NUM_THREADS;
+                if (vec_idx < TOTAL_VECS_W1) {
+                    int n = vec_idx / (K_STEP / VEC_SIZE);
+                    int k = (vec_idx % (K_STEP / VEC_SIZE)) * VEC_SIZE;
+                    int col = inter_k_start + n;
+                    int k_global = k1_start + k;
+                    
+                    float2 buf_lo = {0.f, 0.f}, buf_hi = {0.f, 0.f};
+                    if (col < inter_dim && (k_global + VEC_SIZE - 1) < model_dim) {
+                        const fp8_t* src = &w1_expert[col * model_dim + k_global];
+                        fp8x8_to_bf16x8_scaled(src, scale_gate, buf_lo, buf_hi);
+                    }
+                    store_shared_vec(W1s.idx(W1s_ptr, {n, k}), {buf_lo.x, buf_lo.y});
+                    store_shared_vec(W1s.idx(W1s_ptr, {n, k + 4}), {buf_hi.x, buf_hi.y});
+                }
+            }
+            
+            __syncthreads();
+            
+            // MFMA for gate: compute partial intermediate
+            rt_bf<REG_M, DOT_SLICE> a_tile;
+            
+            #pragma unroll
+            for (int kk = 0; kk < K_STEP / DOT_SLICE; kk++) {
+                load(a_tile, subtile_inplace<REG_M, DOT_SLICE>(As, {warp_row_idx, kk}));
+                
+                #pragma unroll
+                for (int inter_sub = 0; inter_sub < INTER_SUBTILES; inter_sub++) {
+                    rt_bf<DOT_SLICE, DOT_SLICE> b_tile;
+                    load(b_tile, subtile_inplace<DOT_SLICE, DOT_SLICE>(W1s, {inter_sub, kk}));
+                    
+                    __builtin_amdgcn_sched_barrier(0);
+                    asm volatile("s_waitcnt lgkmcnt(0)");
+                    
+                    mma_ABt(C_gate[inter_sub], a_tile, b_tile, C_gate[inter_sub]);
+                }
+            }
+            
+            __syncthreads();
+            
+            // Load W1_up tile and compute
+            int up_col_start = inter_dim + inter_k_start;
+            int n_block_up = up_col_start / SCALE_BLOCK_N;
+            float scale_up = w1_expert_scale[n_block_up * num_scale_k_w1 + k_block];
+            
+            #pragma unroll
+            for (int v = 0; v < (TOTAL_VECS_W1 + NUM_THREADS - 1) / NUM_THREADS; v++) {
+                int vec_idx = lane + v * NUM_THREADS;
+                if (vec_idx < TOTAL_VECS_W1) {
+                    int n = vec_idx / (K_STEP / VEC_SIZE);
+                    int k = (vec_idx % (K_STEP / VEC_SIZE)) * VEC_SIZE;
+                    int col = up_col_start + n;
+                    int k_global = k1_start + k;
+                    
+                    float2 buf_lo = {0.f, 0.f}, buf_hi = {0.f, 0.f};
+                    if (col < inter_dim * 2 && (k_global + VEC_SIZE - 1) < model_dim) {
+                        const fp8_t* src = &w1_expert[col * model_dim + k_global];
+                        fp8x8_to_bf16x8_scaled(src, scale_up, buf_lo, buf_hi);
+                    }
+                    store_shared_vec(W1s.idx(W1s_ptr, {n, k}), {buf_lo.x, buf_lo.y});
+                    store_shared_vec(W1s.idx(W1s_ptr, {n, k + 4}), {buf_hi.x, buf_hi.y});
+                }
+            }
+            
+            __syncthreads();
+            
+            // MFMA for up
+            #pragma unroll
+            for (int kk = 0; kk < K_STEP / DOT_SLICE; kk++) {
+                load(a_tile, subtile_inplace<REG_M, DOT_SLICE>(As, {warp_row_idx, kk}));
+                
+                #pragma unroll
+                for (int inter_sub = 0; inter_sub < INTER_SUBTILES; inter_sub++) {
+                    rt_bf<DOT_SLICE, DOT_SLICE> b_tile;
+                    load(b_tile, subtile_inplace<DOT_SLICE, DOT_SLICE>(W1s, {inter_sub, kk}));
+                    
+                    __builtin_amdgcn_sched_barrier(0);
+                    asm volatile("s_waitcnt lgkmcnt(0)");
+                    
+                    mma_ABt(C_up[inter_sub], a_tile, b_tile, C_up[inter_sub]);
+                }
+            }
+            
+            __syncthreads();
+        }
+        // End of K1 loop for Stage 1 partial
+        
+        // ------------------------------------------------------------------
+        // Apply SiLU to C_gate, multiply by C_up -> C_inter in registers
+        // ------------------------------------------------------------------
+        // C_inter[i] = silu(C_gate[i]) * C_up[i] for each subtile
+        // We'll keep the result in C_gate (reuse the registers)
+        #pragma unroll
+        for (int inter_sub = 0; inter_sub < INTER_SUBTILES; inter_sub++) {
+            auto& gate_tile = C_gate[inter_sub].tiles[0][0];
+            auto& up_tile = C_up[inter_sub].tiles[0][0];
+            
+            #pragma unroll
+            for (int i = 0; i < 2; i++) {
+                float g_x = gate_tile.data[i].x;
+                float g_y = gate_tile.data[i].y;
+                float u_x = up_tile.data[i].x;
+                float u_y = up_tile.data[i].y;
+                
+                float silu_x = g_x / (1.0f + expf(-g_x));
+                float silu_y = g_y / (1.0f + expf(-g_y));
+                
+                gate_tile.data[i].x = silu_x * u_x;
+                gate_tile.data[i].y = silu_y * u_y;
+            }
+        }
+        // Now C_gate contains the intermediate values for this chunk
+        
+        // ------------------------------------------------------------------
+        // STAGE 2: Multiply intermediate by W2 chunk and accumulate to output
+        // ------------------------------------------------------------------
+        // C_out += C_inter × W2[:, inter_k_start:inter_k_start+K_INTER]^T
+        // 
+        // C_inter is [16, K_INTER] per warp (INTER_SUBTILES × [16,16] tiles)
+        // W2 is [N_TILE, K_INTER] = [128, 32]
+        // C_out is [16, 64] per warp
+        
+        // Load W2 slice [128, K_INTER] to LDS
+        uint32_t W2s_ptr = reinterpret_cast<uintptr_t>(&W2s.data[0]);
+        constexpr int VEC_SIZE_W2 = 8;  // bf16 elements per float4
+        constexpr int TOTAL_VECS_W2 = N_TILE * K_INTER / VEC_SIZE_W2;
+        
+        int n_block_w2 = col_start / SCALE_BLOCK_N;
+        int k_block_w2 = inter_k_start / SCALE_BLOCK_K;
+        float scale_w2 = w2_expert_scale[n_block_w2 * num_scale_k_w2 + k_block_w2];
+        
+        #pragma unroll
+        for (int v = 0; v < (TOTAL_VECS_W2 + NUM_THREADS - 1) / NUM_THREADS; v++) {
+            int vec_idx = lane + v * NUM_THREADS;
+            if (vec_idx < TOTAL_VECS_W2) {
+                int n = vec_idx / (K_INTER / VEC_SIZE_W2);
+                int k = (vec_idx % (K_INTER / VEC_SIZE_W2)) * VEC_SIZE_W2;
+                int out_col = col_start + n;
+                int k_global = inter_k_start + k;
+                
+                float2 buf_lo = {0.f, 0.f}, buf_hi = {0.f, 0.f};
+                if (out_col < model_dim && (k_global + VEC_SIZE_W2 - 1) < inter_dim) {
+                    const fp8_t* src = &w2_expert[out_col * inter_dim + k_global];
+                    fp8x8_to_bf16x8_scaled(src, scale_w2, buf_lo, buf_hi);
+                }
+                store_shared_vec(W2s.idx(W2s_ptr, {n, k}), {buf_lo.x, buf_lo.y});
+                store_shared_vec(W2s.idx(W2s_ptr, {n, k + 4}), {buf_hi.x, buf_hi.y});
+            }
+        }
+        
+        __syncthreads();
+        
+        // Store intermediate to LDS temporarily for the MFMA
+        // We need C_inter in LDS to use as A operand for Stage 2 MFMA
+        // This is the intermediate [M_TILE, K_INTER] for this chunk
+        
+        // Actually, we need to convert C_gate (float) to bf16 in LDS for MFMA
+        // Use W1s as the temporary buffer (it's [K_INTER, K_STEP] = [32, 32])
+        // Reshape it as [M_TILE, K_INTER] = [32, 32] - same size!
+        
+        // Write C_gate to LDS
+        const int row_off_s2 = (lane_in_warp / 16) * 4;
+        const int col_off_s2 = lane_in_warp % 16;
+        
+        #pragma unroll
+        for (int inter_sub = 0; inter_sub < INTER_SUBTILES; inter_sub++) {
+            const auto& inter_tile = C_gate[inter_sub].tiles[0][0];
+            int lds_col = inter_sub * DOT_SLICE + col_off_s2;
+            
+            #pragma unroll
+            for (int r = 0; r < 4; r++) {
+                int lds_row = warp_row_base + row_off_s2 + r;
+                if (lds_row < M_TILE && lds_col < K_INTER) {
+                    float val;
+                    if (r == 0) val = inter_tile.data[0].x;
+                    else if (r == 1) val = inter_tile.data[0].y;
+                    else if (r == 2) val = inter_tile.data[1].x;
+                    else val = inter_tile.data[1].y;
+                    
+                    // Store as bf16 to W1s (reusing the buffer)
+                    W1s.data[lds_row * K_INTER + lds_col] = __float2bfloat16(val);
+                }
+            }
+        }
+        
+        __syncthreads();
+        
+        // MFMA for Stage 2: C_out += C_inter × W2^T
+        // C_inter is now in W1s as [M_TILE, K_INTER]
+        // W2 is in W2s as [N_TILE, K_INTER]
+        
+        rt_bf<REG_M, DOT_SLICE> a_tile_s2;
+        
+        #pragma unroll
+        for (int kk = 0; kk < K_INTER / DOT_SLICE; kk++) {  // 2 iterations for K_INTER=32
+            // Load A (intermediate) from W1s reinterpreted as [M_TILE, K_INTER]
+            // W1s is st_bf<K_INTER, K_STEP> but we use it as st_bf<M_TILE, K_INTER>
+            // Since both are [32, 32], we can reinterpret
+            auto& As_reinterp = *reinterpret_cast<st_bf<M_TILE, K_INTER>*>(&W1s);
+            load(a_tile_s2, subtile_inplace<REG_M, DOT_SLICE>(As_reinterp, {warp_row_idx, kk}));
+            
+            #pragma unroll
+            for (int out_sub = 0; out_sub < OUT_SUBTILES; out_sub++) {
+                rt_bf<DOT_SLICE, DOT_SLICE> b_tile_s2;
+                int w2_row_tile = (warp_col_base + out_sub * DOT_SLICE) / DOT_SLICE;
+                load(b_tile_s2, subtile_inplace<DOT_SLICE, DOT_SLICE>(W2s, {w2_row_tile, kk}));
+                
+                __builtin_amdgcn_sched_barrier(0);
+                asm volatile("s_waitcnt lgkmcnt(0)");
+                
+                mma_ABt(C_out[out_sub], a_tile_s2, b_tile_s2, C_out[out_sub]);
+            }
+        }
+        
+        __syncthreads();
+    }
+    // End of inter_chunk loop
+    
+    // ==========================================================================
+    // EPILOGUE: Weighted atomic scatter to output
+    // ==========================================================================
+    const int row_offset_out = (lane_in_warp / 16) * 4;
+    const int col_offset_out = lane_in_warp % 16;
+    
+    #pragma unroll
+    for (int out_sub = 0; out_sub < OUT_SUBTILES; out_sub++) {
+        const auto& out_tile = C_out[out_sub].tiles[0][0];
+        int out_col = col_start + warp_col_base + out_sub * DOT_SLICE + col_offset_out;
+        
+        if (out_col < model_dim) {
+            #pragma unroll
+            for (int r = 0; r < 4; r++) {
+                int m = warp_row_base + row_offset_out + r;
+                if (m < M_TILE) {
+                    int row = row_start + m;
+                    if (row < sorted_M_valid) {
+                        int packed_id = sorted_ids[row];
+                        int token_id = packed_id & 0xFFFFFF;
+                        float weight = sorted_weights[row];
+                        
+                        if (token_id >= 0 && token_id < num_tokens) {
+                            float val;
+                            if (r == 0) val = out_tile.data[0].x;
+                            else if (r == 1) val = out_tile.data[0].y;
+                            else if (r == 2) val = out_tile.data[1].x;
+                            else val = out_tile.data[1].y;
+                            
+                            atomicAdd(&output_fp32[token_id * model_dim + out_col], val * weight);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Dispatch function for streaming kernel
+void dispatch_hk_moe_streaming_fp8(
+    const bf16* hidden_states,
+    const fp8_t* w1_fp8,
+    const fp8_t* w2_fp8,
+    const float* w1_scale,
+    const float* w2_scale,
+    float* output_fp32,
+    const int32_t* sorted_ids,
+    const int32_t* sorted_expert_ids,
+    const int32_t* num_valid_ids,
+    const float* sorted_weights,
+    const int sorted_M,
+    const int num_tokens,
+    const int model_dim,
+    const int inter_dim,
+    const int num_experts,
+    const int block_m_sorting,
+    hipStream_t stream
+) {
+    using namespace stream_cfg;
+    
+    const int num_m_blocks = (sorted_M + M_TILE - 1) / M_TILE;
+    const int num_n_blocks = (model_dim + N_TILE - 1) / N_TILE;
+    
+    const int num_scale_n_w1 = (inter_dim * 2 + fp8_cfg::SCALE_BLOCK_N - 1) / fp8_cfg::SCALE_BLOCK_N;
+    const int num_scale_k_w1 = (model_dim + fp8_cfg::SCALE_BLOCK_K - 1) / fp8_cfg::SCALE_BLOCK_K;
+    const int num_scale_n_w2 = (model_dim + fp8_cfg::SCALE_BLOCK_N - 1) / fp8_cfg::SCALE_BLOCK_N;
+    const int num_scale_k_w2 = (inter_dim + fp8_cfg::SCALE_BLOCK_K - 1) / fp8_cfg::SCALE_BLOCK_K;
+    
+    dim3 grid(num_n_blocks, num_m_blocks);
+    dim3 block(NUM_THREADS);
+    
+    // Shared memory: input tile + W1 tile + W2 tile + token offsets
+    size_t shm_size = sizeof(stream_input_tile) + sizeof(stream_w1_tile) 
+                    + sizeof(stream_w2_tile) + M_TILE * sizeof(int);
+    
+    hk_moe_streaming_fp8_kernel<<<grid, block, shm_size, stream>>>(
+        hidden_states, w1_fp8, w2_fp8, w1_scale, w2_scale,
+        output_fp32, sorted_ids, sorted_expert_ids, num_valid_ids, sorted_weights,
+        sorted_M, num_tokens, model_dim, inter_dim, num_experts,
+        block_m_sorting, num_m_blocks, num_n_blocks,
+        num_scale_n_w1, num_scale_k_w1, num_scale_n_w2, num_scale_k_w2
+    );
+}
+
+
+// ============================================================================
+// Dispatch Function (Original LDS-based fusion)
 // ============================================================================
 void dispatch_hk_moe_fused_fp8(
     const bf16* hidden_states,

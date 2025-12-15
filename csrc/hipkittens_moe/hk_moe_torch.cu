@@ -814,3 +814,64 @@ torch::Tensor hk_fused_moe_fully_fused_fwd(
     
     return output;
 }
+
+/**
+ * Streaming Fusion Forward Pass
+ * 
+ * Uses streaming approach where intermediate stays in registers.
+ * No LDS buffer for intermediate - processes inter_dim in chunks.
+ */
+torch::Tensor hk_fused_moe_streaming_fwd(
+    torch::Tensor hidden_states,     // [num_tokens, model_dim] bf16
+    torch::Tensor w1_fp8,            // [num_experts, inter_dim*2, model_dim] fp8
+    torch::Tensor w2_fp8,            // [num_experts, model_dim, inter_dim] fp8
+    torch::Tensor w1_scale,          // [num_experts, num_scale_n1, num_scale_k1] float
+    torch::Tensor w2_scale,          // [num_experts, num_scale_n2, num_scale_k2] float
+    torch::Tensor topk_weight,       // [num_tokens, topk]
+    torch::Tensor topk_ids,          // [num_tokens, topk]
+    torch::Tensor sorted_ids,        // [sorted_M]
+    torch::Tensor sorted_weights,    // [sorted_M]
+    torch::Tensor sorted_expert_ids, // [num_tiles]
+    torch::Tensor num_valid_ids,     // [num_experts]
+    int topk,
+    int block_m
+) {
+    const int num_tokens = hidden_states.size(0);
+    const int model_dim = hidden_states.size(1);
+    const int num_experts = w1_fp8.size(0);
+    const int inter_dim = w1_fp8.size(1) / 2;
+    const int sorted_M = sorted_ids.size(0);
+    
+    auto options_fp32 = torch::TensorOptions()
+        .dtype(torch::kFloat32)
+        .device(hidden_states.device());
+    
+    torch::Tensor output_fp32 = torch::zeros({num_tokens, model_dim}, options_fp32);
+    torch::Tensor output;
+    
+    hipStream_t stream = at::hip::getCurrentHIPStream();
+    
+    dispatch_hk_moe_streaming_fp8(
+        reinterpret_cast<bf16*>(hidden_states.data_ptr()),
+        get_fp8_ptr(w1_fp8),
+        get_fp8_ptr(w2_fp8),
+        w1_scale.data_ptr<float>(),
+        w2_scale.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        sorted_ids.data_ptr<int32_t>(),
+        sorted_expert_ids.data_ptr<int32_t>(),
+        num_valid_ids.data_ptr<int32_t>(),
+        sorted_weights.data_ptr<float>(),
+        sorted_M,
+        num_tokens,
+        model_dim,
+        inter_dim,
+        num_experts,
+        block_m,
+        stream
+    );
+    
+    output = output_fp32.to(torch::kBFloat16);
+    
+    return output;
+}

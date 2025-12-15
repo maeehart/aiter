@@ -44,6 +44,7 @@ try:
         hipkittens_fused_moe_fp8_fused_act,
         hipkittens_fused_moe_fp8_noatomic,
         hipkittens_fused_moe_fully_fused,
+        hipkittens_fused_moe_streaming,
     )
     HIPKITTENS_AVAILABLE = True
     HIPKITTENS_FP8_AVAILABLE = True
@@ -278,7 +279,12 @@ def bench_hipkittens_fp8_fully_fused(hidden, w1_fp8, w2_fp8, w1_scale, w2_scale,
     return hipkittens_fused_moe_fully_fused(hidden, w1_fp8, w2_fp8, w1_scale, w2_scale, topk_w, topk_ids)
 
 
-def run_fp8_benchmark(batch_sizes, cfg, compare_fused_act=True, compare_noatomic=False, compare_fully_fused=False):
+@perftest()
+def bench_hipkittens_fp8_streaming(hidden, w1_fp8, w2_fp8, w1_scale, w2_scale, topk_w, topk_ids):
+    return hipkittens_fused_moe_streaming(hidden, w1_fp8, w2_fp8, w1_scale, w2_scale, topk_w, topk_ids)
+
+
+def run_fp8_benchmark(batch_sizes, cfg, compare_fused_act=True, compare_noatomic=False, compare_fully_fused=False, compare_streaming=False):
     """Run FP8 blockscale benchmark.
     
     Args:
@@ -412,6 +418,31 @@ def run_fp8_benchmark(batch_sizes, cfg, compare_fused_act=True, compare_noatomic
                 import traceback
                 traceback.print_exc()
         
+        # HipKittens FP8 Streaming Fusion (intermediate in registers)
+        hk_streaming_us, hk_streaming_tf = float('inf'), 0
+        if compare_streaming and HIPKITTENS_FP8_AVAILABLE:
+            try:
+                hk_streaming_out, hk_streaming_us = bench_hipkittens_fp8_streaming(hidden, w1_fp8, w2_fp8, w1_scale, w2_scale, topk_w, topk_ids)
+                hk_streaming_tf = flops / (hk_streaming_us * 1e-6) / 1e12
+                speedup_vs_fused = hk_fused_us / hk_streaming_us if hk_streaming_us > 0 else 0
+                print(f"  HK Streaming:   {hk_streaming_us:8.2f} us, {hk_streaming_tf:6.2f} TFLOPs ({speedup_vs_fused:.2f}x vs fused)")
+                
+                if ref_out is not None:
+                    mismatch = checkAllclose(
+                        ref_out, hk_streaming_out, rtol=0.05, atol=0.1, msg=f"batch={bs}", printLog=False
+                    )
+                    verdict = "PASS" if mismatch == 0 else f"WARN (mismatch={mismatch:.1%})"
+                    print(f"    Correctness: {verdict}")
+                    if mismatch > 0:
+                        nan_count = torch.isnan(hk_streaming_out).sum().item()
+                        inf_count = torch.isinf(hk_streaming_out).sum().item()
+                        if nan_count > 0:
+                            print(f"    DEBUG: NaN count={nan_count}, Inf count={inf_count}")
+            except Exception as e:
+                print(f"  HK Streaming:   Failed - {e}")
+                import traceback
+                traceback.print_exc()
+        
         results.append({
             "batch": bs, 
             "aiter_fp8_us": aiter_fp8_us, "aiter_fp8_tf": aiter_fp8_tf,
@@ -419,6 +450,7 @@ def run_fp8_benchmark(batch_sizes, cfg, compare_fused_act=True, compare_noatomic
             "hk_fused_us": hk_fused_us, "hk_fused_tf": hk_fused_tf,
             "hk_noatomic_us": hk_noatomic_us, "hk_noatomic_tf": hk_noatomic_tf,
             "hk_fullyfused_us": hk_fullyfused_us, "hk_fullyfused_tf": hk_fullyfused_tf,
+            "hk_streaming_us": hk_streaming_us, "hk_streaming_tf": hk_streaming_tf,
         })
     
     print(f"\n{'='*80}")
@@ -504,6 +536,7 @@ if __name__ == "__main__":
     parser.add_argument("--profile-stages", action="store_true", help="Profile Stage1 vs Stage2 timing")
     parser.add_argument("--noatomic", action="store_true", help="Also benchmark atomic-free Stage 2 variant")
     parser.add_argument("--fully-fused", action="store_true", help="Also benchmark fully fused (Stage1+Stage2) kernel")
+    parser.add_argument("--streaming", action="store_true", help="Also benchmark streaming fusion kernel")
     args = parser.parse_args()
     
     if args.profile_stages:
@@ -512,9 +545,9 @@ if __name__ == "__main__":
     elif args.fp8:
         cfg = DEEPSEEK_R1_CONFIG if args.deepseek_r1 else MOE_CONFIG
         if args.quick:
-            run_fp8_benchmark([512, 1024, 2048], cfg, compare_noatomic=args.noatomic, compare_fully_fused=args.fully_fused)
+            run_fp8_benchmark([512, 1024, 2048], cfg, compare_noatomic=args.noatomic, compare_fully_fused=args.fully_fused, compare_streaming=args.streaming)
         else:
-            run_fp8_benchmark(args.batch_sizes, cfg, compare_noatomic=args.noatomic, compare_fully_fused=args.fully_fused)
+            run_fp8_benchmark(args.batch_sizes, cfg, compare_noatomic=args.noatomic, compare_fully_fused=args.fully_fused, compare_streaming=args.streaming)
     else:
         if args.quick:
             run_benchmark([1024, 4096, 8192])
