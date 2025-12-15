@@ -105,21 +105,15 @@
  *    - FP8 note: DeepSeek R1 uses model_dim=7168 (divisible by 128) and inter_dim=256 (divisible by 128).
  *      The FP8 kernel could specialize for these shapes with no boundary checks.
  *
- * [HIGH PRIORITY] 2) Fuse activation to remove the separate activation kernel and halve intermediate bandwidth
- *    - Today Stage1 writes gate|up to global, then another kernel computes:
- *        act = silu(gate) * up
- *      and writes act back into the first half.
- *    - A simplification path is to compute act inside Stage1 and write only act (inter_dim columns).
- *      Benefits:
- *        - remove the activation kernel launch
- *        - remove global write of the gate half entirely
- *        - reduce intermediate global traffic ~2× (5× for the full pipeline!)
- *      Cost:
- *        - adds elementwise nonlinearity + multiply in Stage1's epilogue (but may still be net win).
- *    - Implementation approach for FP8:
- *        - Each workgroup computes BOTH gate and up for the same N columns
- *        - Requires loading gate weights and up weights from w1 (stride by inter_dim)
- *        - Apply silu(gate) * up in registers, write only activated result
+ * [DONE] 2) Fuse activation to remove the separate activation kernel and halve intermediate bandwidth
+ *    - IMPLEMENTED as hk_moe_stage1_fp8_fused_act_kernel
+ *    - Each workgroup computes BOTH gate and up for the same N columns
+ *    - Loads both gate weights (rows 0..inter_dim) and up weights (rows inter_dim..2*inter_dim)
+ *    - Applies silu(gate) * up in registers, writes only activated result (inter_dim cols)
+ *    - Results: 1.04-1.17x speedup depending on batch size
+ *      - Batch 512:  25.3 → 29.5 TFLOPs (1.17x)
+ *      - Batch 2048: 87.3 → 100.2 TFLOPs (1.15x)
+ *    - Python API: hipkittens_fused_moe_fp8_fused_act()
  *
  * 3) Make "valid rows" semantics explicit and uniform
  *    - Prefer `sorted_M_valid` for all row bounds. Any use of `sorted_M` in the hot path risks reading padding
@@ -162,6 +156,19 @@
  *    - model_dim=7168 = 56 × 128, inter_dim=256 = 2 × 128
  *    - Remove all boundary checks for these shapes
  *    - Unroll loops with compile-time constants
+ *
+ * === Remaining Gap to Production (1.9-3x vs AITER) ===
+ *
+ * [HIGH PRIORITY - ARCHITECTURAL] 11) Fuse Stage1 + Stage2 into single kernel
+ *    - AITER's production kernel (fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps) does ALL stages:
+ *      gate-up → activation → down → weighted scatter
+ *    - Current HipKittens: Stage1 + Stage2 as separate kernels
+ *    - Single kernel eliminates:
+ *      - Intermediate global memory write/read (inter_dim * sorted_M * 2 bytes)
+ *      - Second kernel launch overhead
+ *      - L2 cache pressure from intermediate buffer
+ *    - Challenge: Stage1 and Stage2 have different tiling strategies (M×K tiles vs K×N tiles)
+ *    - Possible approach: "flash-MoE" style fusion where each warp computes a small G1U1→act→G2 tile
  */
 #include "hk_moe_kernel.cuh"
 
