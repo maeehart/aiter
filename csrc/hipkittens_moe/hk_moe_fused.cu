@@ -669,18 +669,17 @@ void hk_moe_streaming_fp8_kernel(
     // =========================================================================
     // LDS ALLOCATION (sequential, non-overlapping)
     // =========================================================================
-    // As:        st_bf<32, 32>  - for hidden input / intermediate copy
+    // As:        st_bf<32, 32>  - for hidden input AND intermediate (reused)
     // W1s:       st_bf<32, 32>  - for W1_gate or W1_up weights  
     // W2s:       st_bf<128, 32> - for W2 weights
-    // inter_lds: bf16[32][32]   - raw 2D array for intermediate results
     // token_row_offsets: int[32] - precomputed hidden_states offsets
+    //
+    // NOTE: inter_lds removed - now store intermediate directly to As using HipKittens store()
     
     stream_input_tile (&As) = al.allocate<stream_input_tile>();      // offset 0, size 2KB
     stream_w1_tile (&W1s) = al.allocate<stream_w1_tile>();           // offset 2KB, size 2KB
     stream_w2_tile (&W2s) = al.allocate<stream_w2_tile>();           // offset 4KB, size 8KB
-    bf16 (*inter_lds)[K_INTER] = reinterpret_cast<bf16(*)[K_INTER]>(al.ptr);
-    al.ptr += M_TILE * K_INTER * sizeof(bf16);                       // offset 12KB, size 2KB
-    int* token_row_offsets = (int*)al.allocate<int[M_TILE]>();       // offset 14KB, size 128B
+    int* token_row_offsets = (int*)al.allocate<int[M_TILE]>();       // offset 12KB, size 128B
     
     // =========================================================================
     // WORKGROUP POSITION
@@ -1180,129 +1179,37 @@ void hk_moe_streaming_fp8_kernel(
         __syncthreads();
         
         // -----------------------------------------------------------------
-        // STORE INTERMEDIATE TO inter_lds [M_TILE, K_INTER] = [32, 32]
+        // STORE INTERMEDIATE DIRECTLY TO As USING HipKittens store()
         // -----------------------------------------------------------------
-        // C_gate[inter_sub] contains silu(gate) * up for this warp's rows
-        // Need to write to inter_lds so it can be copied to As for Stage 2 MFMA
-        //
+        // Use HipKittens' native store function to ensure correct layout handling.
+        // C_gate[inter_sub] is rt_fl<16, 16, col> - need to convert to bf16 and store
+        // 
         // WARP COVERAGE:
         //   Warps 0 and 1 both compute rows [0, 16) (same warp_row_idx=0)
         //   Warps 2 and 3 both compute rows [16, 32) (same warp_row_idx=1)
         //   → Only warps 0 and 2 need to write (warp_col_idx=0)
-        //
-        // REGISTER-TO-LDS MAPPING (rt_fl col-major layout):
-        //   lane_in_warp = 0-63
-        //   row_off_s2 = (lane_in_warp / 16) * 4  → {0, 4, 8, 12}
-        //   col_off_s2 = lane_in_warp % 16        → {0, 1, ..., 15}
-        //
-        //   THREAD-TO-LDS MAPPING:
-        //     lane 0-15:  row_off=0,  col_off=0-15   → rows 0-3,   cols 0-15
-        //     lane 16-31: row_off=4,  col_off=0-15   → rows 4-7,   cols 0-15
-        //     lane 32-47: row_off=8,  col_off=0-15   → rows 8-11,  cols 0-15
-        //     lane 48-63: row_off=12, col_off=0-15   → rows 12-15, cols 0-15
-        //
-        //   For inter_sub=0: writes to cols [0, 16)
-        //   For inter_sub=1: writes to cols [16, 32)
-        //
-        // FORMULA: inter_lds[warp_row_base + row_off_s2 + r][inter_sub*16 + col_off_s2]
-        //          = C_gate[inter_sub].tiles[0][0].data[r/2].(x or y)
         
-        const int row_off_s2 = (lane_in_warp / 16) * 4;  // 0, 4, 8, 12 (groups of 16 lanes)
-        const int col_off_s2 = lane_in_warp % 16;        // 0-15 (column within subtile)
+        // Convert C_gate from float to bf16 for storing to As
+        // As is st_bf<M_TILE, K_STEP> = st_bf<32, 32>
+        // Each warp stores a [16, 32] region using 2 inter_subtiles of [16, 16]
         
         if (warp_col_idx == 0) {  // Only warps 0 and 2 write
             #pragma unroll
             for (int inter_sub = 0; inter_sub < INTER_SUBTILES; inter_sub++) {
-                const auto& inter_tile = C_gate[inter_sub].tiles[0][0];
-                // FORMULA: lds_col = inter_sub * 16 + col_off_s2
-                //          For inter_sub=0: cols 0-15
-                //          For inter_sub=1: cols 16-31
-                int lds_col = inter_sub * DOT_SLICE + col_off_s2;
+                // Convert rt_fl to rt_bf for storing
+                rt_bf<REG_M, DOT_SLICE, ducks::rt_layout::col> C_gate_bf16;
+                copy(C_gate_bf16, C_gate[inter_sub]);  // float32 → bf16 conversion
                 
-                #pragma unroll
-                for (int r = 0; r < 4; r++) {
-                    // FORMULA: lds_row = warp_row_base + row_off_s2 + r
-                    //   warp 0: warp_row_base=0,  rows 0-15
-                    //   warp 2: warp_row_base=16, rows 16-31
-                    int lds_row = warp_row_base + row_off_s2 + r;
-                    if (lds_row < M_TILE && lds_col < K_INTER) {
-                        // FORMULA: val = data[r/2].(x if r%2==0 else y)
-                        //   r=0: data[0].x
-                        //   r=1: data[0].y
-                        //   r=2: data[1].x
-                        //   r=3: data[1].y
-                        float val;
-                        if (r == 0) val = inter_tile.data[0].x;
-                        else if (r == 1) val = inter_tile.data[0].y;
-                        else if (r == 2) val = inter_tile.data[1].x;
-                        else val = inter_tile.data[1].y;
-                        
-                        // STORE: inter_lds[row][col] = bf16(val)
-                        inter_lds[lds_row][lds_col] = __float2bfloat16(val);
-                    }
-                }
+                // Store to the appropriate subtile of As
+                // warp_row_idx determines row offset (0 or 16)
+                // inter_sub determines col offset (0 or 16)
+                auto As_subtile = subtile_inplace<REG_M, DOT_SLICE>(As, {warp_row_idx, inter_sub});
+                store(As_subtile, C_gate_bf16);
             }
         }
         
         __syncthreads();
-        // After sync: inter_lds[0:32, 0:32] contains full intermediate for this chunk
-        
-        // -----------------------------------------------------------------
-        // COPY INTERMEDIATE: inter_lds[32,32] → As[32,32] for MFMA
-        // -----------------------------------------------------------------
-        // inter_lds is a raw bf16[32][32] array
-        // As is a st_bf<32, 32> shared tile (HipKittens type)
-        // We need to copy so subtile_inplace can load subtiles correctly
-        //
-        // INDEXING (STRIDED pattern):
-        //   VEC_SIZE_S2 = 8 bf16 per vector
-        //   VECS_PER_ROW_S2 = K_INTER / 8 = 32 / 8 = 4 vectors per row
-        //   TOTAL_VECS_S2 = M_TILE * 4 = 32 * 4 = 128 vectors total
-        //   
-        //   vec_idx = lane + v * 256  (STRIDED: lane determines position)
-        //   Loop runs once (v=0) since 128 < 256
-        //   Only threads 0-127 do work
-        //
-        //   m = vec_idx / 4   → row in [0, 32)
-        //   k = (vec_idx % 4) * 8   → col: 0, 8, 16, or 24
-        //
-        // COPIES: inter_lds[m][k:k+8] → As[m, k:k+8]
-        
-        uint32_t As_ptr_s2 = reinterpret_cast<uintptr_t>(&As.data[0]);
-        constexpr int VEC_SIZE_S2 = 8;
-        constexpr int VECS_PER_ROW_S2 = K_INTER / VEC_SIZE_S2;      // 4
-        constexpr int TOTAL_VECS_S2 = M_TILE * VECS_PER_ROW_S2;      // 128
-        
-        #pragma unroll
-        for (int v = 0; v < (TOTAL_VECS_S2 + NUM_THREADS - 1) / NUM_THREADS; v++) {
-            int vec_idx = lane + v * NUM_THREADS;  // lane ∈ [0,255], v=0 → vec_idx = lane
-            if (vec_idx < TOTAL_VECS_S2) {         // Only if vec_idx < 128
-                int m = vec_idx / VECS_PER_ROW_S2;              // Row: 0-31
-                int k = (vec_idx % VECS_PER_ROW_S2) * VEC_SIZE_S2; // Col: 0, 8, 16, 24
-                
-                // READ: 8 bf16 values from inter_lds[m][k:k+8]
-                bf16* src = &inter_lds[m][k];
-                
-                // Pack bf16 pairs into float2 for store_shared_vec
-                __hip_bfloat162 v01 = *reinterpret_cast<const __hip_bfloat162*>(&src[0]);
-                __hip_bfloat162 v23 = *reinterpret_cast<const __hip_bfloat162*>(&src[2]);
-                __hip_bfloat162 v45 = *reinterpret_cast<const __hip_bfloat162*>(&src[4]);
-                __hip_bfloat162 v67 = *reinterpret_cast<const __hip_bfloat162*>(&src[6]);
-                
-                float2 packed_lo, packed_hi;
-                memcpy(&packed_lo.x, &v01, sizeof(float));  // bf16[0:2] → float
-                memcpy(&packed_lo.y, &v23, sizeof(float));  // bf16[2:4] → float
-                memcpy(&packed_hi.x, &v45, sizeof(float));  // bf16[4:6] → float
-                memcpy(&packed_hi.y, &v67, sizeof(float));  // bf16[6:8] → float
-                
-                // STORE: As[m, k:k+4] and As[m, k+4:k+8]
-                store_shared_vec(As.idx(As_ptr_s2, {m, k}), packed_lo);
-                store_shared_vec(As.idx(As_ptr_s2, {m, k + 4}), packed_hi);
-            }
-        }
-        
-        __syncthreads();
-        // After sync: As[0:32, 0:32] contains intermediate from inter_lds
+        // After sync: As[0:32, 0:32] contains full intermediate for this chunk
         
         // -----------------------------------------------------------------
         // STAGE 2 MFMA: C_out += As @ W2s^T
@@ -1479,9 +1386,10 @@ void dispatch_hk_moe_streaming_fp8(
     dim3 grid(num_n_blocks, num_m_blocks);
     dim3 block(NUM_THREADS);
     
-    // Shared memory: input tile + W1 tile + raw intermediate + W2 tile + token offsets
+    // Shared memory: input tile + W1 tile + W2 tile + token offsets
+    // NOTE: inter_lds removed - intermediate stored directly to As
     size_t shm_size = sizeof(stream_input_tile) + sizeof(stream_w1_tile) 
-                    + M_TILE * K_INTER * sizeof(bf16) + sizeof(stream_w2_tile) + M_TILE * sizeof(int);
+                    + sizeof(stream_w2_tile) + M_TILE * sizeof(int);
     
     hk_moe_streaming_fp8_kernel<<<grid, block, shm_size, stream>>>(
         hidden_states, w1_fp8, w2_fp8, w1_scale, w2_scale,
