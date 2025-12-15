@@ -691,7 +691,11 @@ void hk_moe_streaming_fp8_kernel(
     // ==========================================================================
     const int num_inter_chunks = (inter_dim + K_INTER - 1) / K_INTER;
     
-    for (int inter_chunk = 0; inter_chunk < num_inter_chunks; inter_chunk++) {
+    // DEBUG: Process only first chunk to isolate issue
+    // const int debug_max_chunks = 1;
+    const int debug_max_chunks = num_inter_chunks;
+    
+    for (int inter_chunk = 0; inter_chunk < debug_max_chunks; inter_chunk++) {
         const int inter_k_start = inter_chunk * K_INTER;  // Start of this inter_dim slice
         
         // ------------------------------------------------------------------
@@ -872,17 +876,19 @@ void hk_moe_streaming_fp8_kernel(
         // C_out is [16, 64] per warp
         
         // Load W2 slice [128, K_INTER] to LDS
+        // Use same interleaved pattern as original LDS fusion
         uint32_t W2s_ptr = reinterpret_cast<uintptr_t>(&W2s.data[0]);
         constexpr int VEC_SIZE_W2 = 8;  // bf16 elements per float4
         constexpr int TOTAL_VECS_W2 = N_TILE * K_INTER / VEC_SIZE_W2;
+        constexpr int VECS_PER_THREAD_W2 = (TOTAL_VECS_W2 + NUM_THREADS - 1) / NUM_THREADS;  // 2
         
         int n_block_w2 = col_start / SCALE_BLOCK_N;
         int k_block_w2 = inter_k_start / SCALE_BLOCK_K;
         float scale_w2 = w2_expert_scale[n_block_w2 * num_scale_k_w2 + k_block_w2];
         
         #pragma unroll
-        for (int v = 0; v < (TOTAL_VECS_W2 + NUM_THREADS - 1) / NUM_THREADS; v++) {
-            int vec_idx = lane + v * NUM_THREADS;
+        for (int v = 0; v < VECS_PER_THREAD_W2; v++) {
+            int vec_idx = lane * VECS_PER_THREAD_W2 + v;  // Interleaved like original
             if (vec_idx < TOTAL_VECS_W2) {
                 int n = vec_idx / (K_INTER / VEC_SIZE_W2);
                 int k = (vec_idx % (K_INTER / VEC_SIZE_W2)) * VEC_SIZE_W2;
