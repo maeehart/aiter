@@ -503,7 +503,7 @@ void hk_moe_stage1_kernel_mma(
     }
 }
 
-// Dispatch function
+// Dispatch function for BF16 weights
 void dispatch_hk_moe_stage1(const moe_stage1_globals& g) {
     using namespace s1_cfg;
     
@@ -536,5 +536,365 @@ void dispatch_hk_moe_stage1(const moe_stage1_globals& g) {
         g.block_m,
         num_m_blocks,
         num_n_blocks
+    );
+}
+
+// ============================================================================
+// FP8 Blockscale Variant - Stage 1
+// ============================================================================
+// 
+// This kernel performs the same Gate-Up projection as the BF16 kernel but with:
+// - FP8 (e4m3fnuz) weights instead of BF16
+// - Per-block scales for dequantization (typically 128x128 blocks)
+// - On-the-fly dequantization: bf16_val = fp8_val * scale
+//
+// The scale layout follows DeepSeek R1 / aiter convention:
+//   w1_scale: [num_experts, num_scale_n, num_scale_k] flattened
+//   where num_scale_n = ceil(inter_dim*2 / 128), num_scale_k = ceil(model_dim / 128)
+
+__global__ __launch_bounds__(s1_cfg::NUM_THREADS, 2)
+void hk_moe_stage1_fp8_kernel_mma(
+    const bf16* __restrict__ hidden_states,  // [num_tokens, model_dim]
+    const fp8_t* __restrict__ w1_fp8,        // [num_experts, inter_dim*2, model_dim] as FP8
+    const float* __restrict__ w1_scale,      // [num_experts, num_scale_n, num_scale_k] flattened
+    bf16* __restrict__ intermediate,         // [sorted_M, inter_dim*2]
+    const int32_t* __restrict__ sorted_ids,
+    const int32_t* __restrict__ sorted_expert_ids,
+    const int32_t* __restrict__ num_valid_ids,
+    const int sorted_M,
+    const int num_tokens,
+    const int model_dim,
+    const int inter_dim,
+    const int num_experts,
+    const int block_m_sorting,
+    const int num_m_blocks,
+    const int num_n_blocks,
+    const int num_scale_n,
+    const int num_scale_k
+) {
+    using namespace s1_cfg;
+    using namespace fp8_cfg;
+    
+    const int sorted_M_valid = num_valid_ids[0];
+    
+    extern __shared__ alignment_dummy __shm[];
+    shared_allocator al((int*)&__shm[0]);
+    
+    // Allocate shared memory tiles
+    s1_st_tile (&As) = al.allocate<s1_st_tile>();
+    s1_st_tile (&Bs0) = al.allocate<s1_st_tile>();
+    s1_st_tile (&Bs1) = al.allocate<s1_st_tile>();
+    int (&token_row_offsets)[BLOCK_SIZE] = al.allocate<int, BLOCK_SIZE>();
+    
+    const uint32_t As_ptr  = reinterpret_cast<uintptr_t>(&As.data[0]);
+    const uint32_t Bs0_ptr = reinterpret_cast<uintptr_t>(&Bs0.data[0]);
+    const uint32_t Bs1_ptr = reinterpret_cast<uintptr_t>(&Bs1.data[0]);
+    
+    const int total_n = inter_dim * 2;
+    
+    // Register tiles for MMA
+    rt_bf<REG_BLOCK, DOT_SLICE> a_tile, b_tile;
+    rt_fl<REG_BLOCK, REG_BLOCK, ducks::rt_layout::col> C_accum[2];
+    zero(C_accum[0]);
+    zero(C_accum[1]);
+    
+    // XCD-aware block scheduling (same as BF16 kernel)
+    int wgid = (blockIdx.y * gridDim.x) + blockIdx.x;
+    const int NUM_WGS = gridDim.x * gridDim.y;
+    wgid = chiplet_transform_chunked(wgid, NUM_WGS, NUM_XCDS, WGM * WGM);
+    
+    if (wgid >= NUM_WGS) return;
+    
+    int pid_m = wgid / num_n_blocks;
+    int pid_n = wgid % num_n_blocks;
+    
+    if (pid_m >= num_m_blocks || pid_n >= num_n_blocks) return;
+    
+    const int row_start = pid_m * BLOCK_SIZE;
+    const int col_start = pid_n * BLOCK_SIZE;
+    
+    if (row_start >= sorted_M_valid || col_start >= total_n) return;
+    
+    const int tile_id = row_start / block_m_sorting;
+    const int expert_id = sorted_expert_ids[tile_id];
+    
+    if (expert_id < 0 || expert_id >= num_experts) return;
+    
+    // Expert's FP8 weight base and scale base
+    const fp8_t* w1_expert_fp8 = w1_fp8 + expert_id * (size_t)total_n * model_dim;
+    const float* w1_expert_scale = w1_scale + expert_id * (size_t)num_scale_n * num_scale_k;
+    
+    const int warp_id = warpid();
+    const int warp_row = warp_id / 4;
+    const int warp_col = warp_id % 4;
+    
+    const int num_k_tiles = (model_dim + K_STEP - 1) / K_STEP;
+    const int lane = threadIdx.x;
+    constexpr int VEC_SIZE = 8;  // FP8 elements per vector load
+
+    // Precompute token row base offsets (same as BF16 kernel)
+    if (lane < BLOCK_SIZE) {
+        const int row = row_start + lane;
+        int base = -1;
+        if (row < sorted_M_valid) {
+            const int packed_id = sorted_ids[row];
+            const int token_id = packed_id & 0xFFFFFF;
+            if (token_id >= 0 && token_id < num_tokens) base = token_id * model_dim;
+        }
+        token_row_offsets[lane] = base;
+    }
+    __syncthreads();
+
+    // === Helper lambda: Load FP8 weight tile with blockscale dequantization ===
+    auto load_w1_fp8_tile = [&](s1_st_tile& Bs, uint32_t Bs_ptr, int k_start) {
+        constexpr int VEC_SIZE_W = 8;
+        constexpr int TOTAL_VECS_W = (BLOCK_SIZE * K_STEP) / VEC_SIZE_W;
+        constexpr int VECS_PER_THREAD_W = TOTAL_VECS_W / NUM_THREADS;
+
+        #pragma unroll
+        for (int v = 0; v < VECS_PER_THREAD_W; v++) {
+            const int n = (lane >> 2);              // lane/4 -> which of 128 N rows
+            const int k = (lane & 3) << 3;          // (lane%4)*8 -> which K offset
+
+            int col = col_start + n;  // Global N coordinate
+            int k_global = k_start + k;  // Global K coordinate
+            
+            float2 buf_lo = {0.f, 0.f};
+            float2 buf_hi = {0.f, 0.f};
+            
+            if (col < total_n && (k_global + VEC_SIZE_W - 1) < model_dim) {
+                // Compute scale block indices
+                // Scale layout: [expert, n_block, k_block] where blocks are SCALE_BLOCK_N x SCALE_BLOCK_K
+                int n_block = col / SCALE_BLOCK_N;
+                int k_block = k_global / SCALE_BLOCK_K;
+                float scale = w1_expert_scale[n_block * num_scale_k + k_block];
+                
+                // Load 8 FP8 values and dequantize
+                const fp8_t* src = &w1_expert_fp8[col * model_dim + k_global];
+                fp8x8_to_bf16x8_scaled(src, scale, buf_lo, buf_hi);
+            }
+
+            store_shared_vec(Bs.idx(Bs_ptr, {n, k}), {buf_lo.x, buf_lo.y});
+            store_shared_vec(Bs.idx(Bs_ptr, {n, k + 4}), {buf_hi.x, buf_hi.y});
+        }
+    };
+
+    // Preload first weight K-tile (k_tile = 0) into Bs0
+    load_w1_fp8_tile(Bs0, Bs0_ptr, 0);
+    __syncthreads();
+
+    // Main K-loop (same structure as BF16 kernel)
+    for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) {
+        const int k_start = k_tile * K_STEP;
+        s1_st_tile& Bs_cur = (k_tile & 1) ? Bs1 : Bs0;
+        const uint32_t Bs_cur_ptr = (k_tile & 1) ? Bs1_ptr : Bs0_ptr;
+        
+        // Load input tile (BF16 activations - same as original)
+        constexpr int ROWS_PER_BLOCK = BLOCK_SIZE;
+        constexpr int VECS_PER_ROW = K_STEP / VEC_SIZE;
+        constexpr int TOTAL_VECS = ROWS_PER_BLOCK * VECS_PER_ROW;
+        constexpr int VECS_PER_THREAD = TOTAL_VECS / NUM_THREADS;
+        
+        #pragma unroll
+        for (int v = 0; v < VECS_PER_THREAD; v++) {
+            int vec_idx = lane * VECS_PER_THREAD + v;
+            int m = vec_idx / VECS_PER_ROW;
+            int k = (vec_idx % VECS_PER_ROW) * VEC_SIZE;
+
+            float4 buf = {0.f, 0.f, 0.f, 0.f};
+            const int base = token_row_offsets[m];
+            if (base >= 0 && (k_start + k + VEC_SIZE - 1) < model_dim) {
+                buf = load_global_vec4(reinterpret_cast<const float4*>(
+                    &hidden_states[base + k_start + k]
+                ));
+            }
+
+            store_shared_vec(As.idx(As_ptr, {m, k}), {buf.x, buf.y});
+            store_shared_vec(As.idx(As_ptr, {m, k + 4}), {buf.z, buf.w});
+        }
+
+        __syncthreads();
+
+        // Prefetch next weight K-tile (FP8 dequantization)
+        // Store prefetched bf16 values directly to alternate buffer
+        if (k_tile + 1 < num_k_tiles) {
+            s1_st_tile& Bs_next = (k_tile & 1) ? Bs0 : Bs1;
+            const uint32_t Bs_next_ptr = (k_tile & 1) ? Bs0_ptr : Bs1_ptr;
+            
+            // Note: We load into registers for prefetch overlap, then store
+            // For FP8, we do dequantization during the load
+            constexpr int TOTAL_VECS_W = (BLOCK_SIZE * K_STEP) / VEC_SIZE;
+            constexpr int VECS_PER_THREAD_W = TOTAL_VECS_W / NUM_THREADS;
+            float2 prefetch_lo[VECS_PER_THREAD_W];
+            float2 prefetch_hi[VECS_PER_THREAD_W];
+            
+            const int k_start_next = (k_tile + 1) * K_STEP;
+            
+            #pragma unroll
+            for (int v = 0; v < VECS_PER_THREAD_W; v++) {
+                const int n = (lane >> 2);
+                const int k = (lane & 3) << 3;
+                const int col = col_start + n;
+                const int k_global = k_start_next + k;
+                
+                prefetch_lo[v] = {0.f, 0.f};
+                prefetch_hi[v] = {0.f, 0.f};
+                
+                if (col < total_n && (k_global + VEC_SIZE - 1) < model_dim) {
+                    int n_block = col / SCALE_BLOCK_N;
+                    int k_block = k_global / SCALE_BLOCK_K;
+                    float scale = w1_expert_scale[n_block * num_scale_k + k_block];
+                    
+                    const fp8_t* src = &w1_expert_fp8[col * model_dim + k_global];
+                    fp8x8_to_bf16x8_scaled(src, scale, prefetch_lo[v], prefetch_hi[v]);
+                }
+            }
+            
+            // MFMA compute on current tile
+            #pragma unroll
+            for (int kk = 0; kk < K_STEP / DOT_SLICE; kk++) {
+                load(a_tile, subtile_inplace<REG_BLOCK, DOT_SLICE>(As, {warp_row, kk}));
+                load(b_tile, subtile_inplace<REG_BLOCK, DOT_SLICE>(Bs_cur, {warp_col, kk}));
+                
+                __builtin_amdgcn_sched_barrier(0);
+                asm volatile("s_waitcnt lgkmcnt(0)");
+                
+                __builtin_amdgcn_s_setprio(1);
+                mma_ABt(C_accum[0], a_tile, b_tile, C_accum[0]);
+                __builtin_amdgcn_s_setprio(0);
+                
+                __builtin_amdgcn_sched_barrier(0);
+                
+                load(a_tile, subtile_inplace<REG_BLOCK, DOT_SLICE>(As, {warp_row + 2, kk}));
+                
+                __builtin_amdgcn_sched_barrier(0);
+                asm volatile("s_waitcnt lgkmcnt(0)");
+                
+                __builtin_amdgcn_s_setprio(1);
+                mma_ABt(C_accum[1], a_tile, b_tile, C_accum[1]);
+                __builtin_amdgcn_s_setprio(0);
+                
+                __builtin_amdgcn_sched_barrier(0);
+            }
+            
+            __syncthreads();
+            
+            // Store prefetched weights to next buffer
+            #pragma unroll
+            for (int v = 0; v < VECS_PER_THREAD_W; v++) {
+                const int n = (lane >> 2);
+                const int k = (lane & 3) << 3;
+                store_shared_vec(Bs_next.idx(Bs_next_ptr, {n, k}), {prefetch_lo[v].x, prefetch_lo[v].y});
+                store_shared_vec(Bs_next.idx(Bs_next_ptr, {n, k + 4}), {prefetch_hi[v].x, prefetch_hi[v].y});
+            }
+        } else {
+            // Last K-tile: just do MFMA, no prefetch needed
+            #pragma unroll
+            for (int kk = 0; kk < K_STEP / DOT_SLICE; kk++) {
+                load(a_tile, subtile_inplace<REG_BLOCK, DOT_SLICE>(As, {warp_row, kk}));
+                load(b_tile, subtile_inplace<REG_BLOCK, DOT_SLICE>(Bs_cur, {warp_col, kk}));
+                
+                __builtin_amdgcn_sched_barrier(0);
+                asm volatile("s_waitcnt lgkmcnt(0)");
+                
+                __builtin_amdgcn_s_setprio(1);
+                mma_ABt(C_accum[0], a_tile, b_tile, C_accum[0]);
+                __builtin_amdgcn_s_setprio(0);
+                
+                __builtin_amdgcn_sched_barrier(0);
+                
+                load(a_tile, subtile_inplace<REG_BLOCK, DOT_SLICE>(As, {warp_row + 2, kk}));
+                
+                __builtin_amdgcn_sched_barrier(0);
+                asm volatile("s_waitcnt lgkmcnt(0)");
+                
+                __builtin_amdgcn_s_setprio(1);
+                mma_ABt(C_accum[1], a_tile, b_tile, C_accum[1]);
+                __builtin_amdgcn_s_setprio(0);
+                
+                __builtin_amdgcn_sched_barrier(0);
+            }
+            
+            __syncthreads();
+        }
+    }
+    
+    // Store results (same as BF16 kernel)
+    const int out_row_base_0 = row_start + warp_row * 32;
+    const int out_row_base_1 = row_start + (warp_row + 2) * 32;
+    const int out_col_base = col_start + warp_col * 32;
+    const int lane_id = laneid();
+    const int row_off = 4 * (lane_id / 16);
+    const int col_off = lane_id % 16;
+    
+    #pragma unroll
+    for (int tile_row = 0; tile_row < 2; tile_row++) {
+        #pragma unroll
+        for (int tile_col = 0; tile_col < 2; tile_col++) {
+            const auto& tile = C_accum[0].tiles[tile_row][tile_col];
+            int base_row = out_row_base_0 + tile_row * 16 + row_off;
+            int col = out_col_base + tile_col * 16 + col_off;
+            
+            if (col < total_n) {
+                if (base_row + 0 < sorted_M_valid) intermediate[(base_row + 0) * total_n + col] = __float2bfloat16(tile.data[0].x);
+                if (base_row + 1 < sorted_M_valid) intermediate[(base_row + 1) * total_n + col] = __float2bfloat16(tile.data[0].y);
+                if (base_row + 2 < sorted_M_valid) intermediate[(base_row + 2) * total_n + col] = __float2bfloat16(tile.data[1].x);
+                if (base_row + 3 < sorted_M_valid) intermediate[(base_row + 3) * total_n + col] = __float2bfloat16(tile.data[1].y);
+            }
+        }
+    }
+    
+    #pragma unroll
+    for (int tile_row = 0; tile_row < 2; tile_row++) {
+        #pragma unroll
+        for (int tile_col = 0; tile_col < 2; tile_col++) {
+            const auto& tile = C_accum[1].tiles[tile_row][tile_col];
+            int base_row = out_row_base_1 + tile_row * 16 + row_off;
+            int col = out_col_base + tile_col * 16 + col_off;
+            
+            if (col < total_n) {
+                if (base_row + 0 < sorted_M_valid) intermediate[(base_row + 0) * total_n + col] = __float2bfloat16(tile.data[0].x);
+                if (base_row + 1 < sorted_M_valid) intermediate[(base_row + 1) * total_n + col] = __float2bfloat16(tile.data[0].y);
+                if (base_row + 2 < sorted_M_valid) intermediate[(base_row + 2) * total_n + col] = __float2bfloat16(tile.data[1].x);
+                if (base_row + 3 < sorted_M_valid) intermediate[(base_row + 3) * total_n + col] = __float2bfloat16(tile.data[1].y);
+            }
+        }
+    }
+}
+
+// Dispatch function for FP8 weights with blockscale
+void dispatch_hk_moe_stage1_fp8(const moe_stage1_fp8_globals& g) {
+    using namespace s1_cfg;
+    
+    const int total_n = g.inter_dim * 2;
+    
+    const int num_m_blocks = (g.sorted_M + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const int num_n_blocks = (total_n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    
+    dim3 grid(num_n_blocks, num_m_blocks);
+    dim3 block(NUM_THREADS);
+    
+    size_t smem_size = sizeof(s1_st_tile) * 3 + sizeof(int) * BLOCK_SIZE + 256;
+    hipFuncSetAttribute((void*)hk_moe_stage1_fp8_kernel_mma, 
+                        hipFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    
+    hk_moe_stage1_fp8_kernel_mma<<<grid, block, smem_size, g.stream>>>(
+        g.hidden_states.raw_ptr,
+        g.w1_fp8,
+        g.w1_scale,
+        g.intermediate.raw_ptr,
+        g.sorted_ids,
+        g.sorted_expert_ids,
+        g.num_valid_ids,
+        g.sorted_M,
+        g.num_tokens,
+        g.model_dim,
+        g.inter_dim,
+        g.num_experts,
+        g.block_m,
+        num_m_blocks,
+        num_n_blocks,
+        g.num_scale_n,
+        g.num_scale_k
     );
 }

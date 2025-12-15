@@ -6,6 +6,8 @@ HipKittens MoE Benchmark Script
 Benchmarks HipKittens MoE kernel against baseline AITER for high batch sizes.
 Based on CSV data showing performance issues at 4000-8600 tokens in prefill.
 
+Supports both BF16 weights and FP8 blockscale weights (DeepSeek R1 format).
+
 Usage:
     # Quick test with 3 batch sizes (1024, 4096, 8192)
     python test_hipkittens_moe.py --quick
@@ -15,6 +17,9 @@ Usage:
     
     # Custom batch sizes
     python test_hipkittens_moe.py --batch-sizes 4000 6000 8000
+    
+    # FP8 blockscale benchmark (DeepSeek R1 config)
+    python test_hipkittens_moe.py --fp8 --deepseek-r1
 
 Output:
     - Timing comparison (AITER vs HipKittens)
@@ -24,17 +29,22 @@ Output:
 
 import argparse
 import torch
+import math
 from aiter import dtypes
 from aiter.test_common import checkAllclose, perftest
 from aiter.fused_moe import fused_moe, fused_topk, torch_moe
 from aiter import ActivationType, QuantType
+from aiter import pertoken_quant
+from einops import rearrange
 
 try:
-    from aiter.hipkittens_moe import hipkittens_fused_moe
+    from aiter.hipkittens_moe import hipkittens_fused_moe, hipkittens_fused_moe_fp8
     HIPKITTENS_AVAILABLE = True
+    HIPKITTENS_FP8_AVAILABLE = True
 except ImportError as e:
     print(f"HipKittens MoE not available: {e}")
     HIPKITTENS_AVAILABLE = False
+    HIPKITTENS_FP8_AVAILABLE = False
 
 # Use PyTorch reference as ground truth (AITER ASM kernels have numerical differences at large sizes)
 USE_PYTORCH_REF = True
@@ -47,6 +57,14 @@ HIGH_BATCH_SIZES = [480, 1547, 2907, 4132, 4644, 5913, 7339, 8613]
 MOE_CONFIG_FULL = {"model_dim": 7168, "inter_dim": 7168, "num_experts": 256, "topk": 8}
 MOE_CONFIG_SMALL = {"model_dim": 4096, "inter_dim": 4096, "num_experts": 8, "topk": 2}
 MOE_CONFIG = MOE_CONFIG_SMALL  # Use smaller config for testing
+
+# DeepSeek R1 MoE config from CSV roofline data
+# model_dim=7168, inter_dim=256, experts=256, topk=8
+DEEPSEEK_R1_CONFIG = {"model_dim": 7168, "inter_dim": 256, "num_experts": 256, "topk": 8}
+
+# FP8 blockscale configuration (128x128 blocks)
+FP8_SCALE_BLOCK_N = 128
+FP8_SCALE_BLOCK_K = 128
 
 
 def create_inputs(batch_size, cfg, dtype=torch.bfloat16, device="cuda"):
@@ -141,14 +159,154 @@ def run_benchmark(batch_sizes):
         print(f"{r['batch']:>8} | {r['aiter_us']:>12.2f} | {r['hk_us']:>12.2f} | {sp:>8}")
 
 
+def quantize_weights_blockscale(w, scale_blk_n=128, scale_blk_k=128):
+    """
+    Quantize weights to FP8 with blockscale.
+    
+    Args:
+        w: Weight tensor [E, N, K] in bf16/fp32
+        scale_blk_n: Block size in N dimension
+        scale_blk_k: Block size in K dimension
+        
+    Returns:
+        w_fp8: Quantized weights [E, N, K] as FP8
+        w_scale: Scales [E, ceil(N/blk_n), ceil(K/blk_k)] as float32
+    """
+    E, N, K = w.shape
+    quant_dtype = dtypes.fp8
+    
+    # Reshape for block quantization
+    num_blk_n = math.ceil(N / scale_blk_n)
+    num_blk_k = math.ceil(K / scale_blk_k)
+    
+    # Pad if needed
+    N_padded = num_blk_n * scale_blk_n
+    K_padded = num_blk_k * scale_blk_k
+    
+    if N_padded != N or K_padded != K:
+        w_padded = torch.zeros((E, N_padded, K_padded), dtype=w.dtype, device=w.device)
+        w_padded[:, :N, :K] = w
+        w = w_padded
+    
+    # Rearrange for block quantization
+    tmp = rearrange(
+        w.view(E, num_blk_n, scale_blk_n, num_blk_k, scale_blk_k),
+        "e num_blk_n blk_n num_blk_k blk_k -> e num_blk_n num_blk_k (blk_n blk_k)",
+    ).contiguous()
+    
+    # Quantize per block
+    w_q, w_scale = pertoken_quant(tmp, quant_dtype=quant_dtype)
+    
+    # Reshape back
+    w_q = rearrange(
+        w_q.view(E, num_blk_n, num_blk_k, scale_blk_n, scale_blk_k),
+        "e num_blk_n num_blk_k blk_n blk_k -> e (num_blk_n blk_n) (num_blk_k blk_k)",
+    ).contiguous()
+    
+    # Take original size
+    w_q = w_q[:, :N, :K].contiguous()
+    w_scale = w_scale.view(E, num_blk_n, num_blk_k)
+    
+    return w_q, w_scale
+
+
+def create_fp8_inputs(batch_size, cfg, dtype=torch.bfloat16, device="cuda"):
+    """Create inputs with FP8 quantized weights for DeepSeek R1 format."""
+    hidden = torch.randn((batch_size, cfg["model_dim"]), dtype=dtype, device=device) / 10
+    
+    # Create bf16 weights first
+    w1_bf16 = torch.randn((cfg["num_experts"], cfg["inter_dim"] * 2, cfg["model_dim"]), dtype=dtype, device=device) / 10
+    w2_bf16 = torch.randn((cfg["num_experts"], cfg["model_dim"], cfg["inter_dim"]), dtype=dtype, device=device) / 10
+    
+    # Quantize to FP8 with blockscale
+    w1_fp8, w1_scale = quantize_weights_blockscale(w1_bf16, FP8_SCALE_BLOCK_N, FP8_SCALE_BLOCK_K)
+    w2_fp8, w2_scale = quantize_weights_blockscale(w2_bf16, FP8_SCALE_BLOCK_N, FP8_SCALE_BLOCK_K)
+    
+    scores = torch.randn((batch_size, cfg["num_experts"]), dtype=torch.float32, device=device)
+    topk_w, topk_ids = fused_topk(hidden, scores, cfg["topk"], True)
+    
+    return hidden, w1_bf16, w2_bf16, w1_fp8, w2_fp8, w1_scale, w2_scale, topk_w, topk_ids
+
+
+@perftest()
+def bench_hipkittens_fp8(hidden, w1_fp8, w2_fp8, w1_scale, w2_scale, topk_w, topk_ids):
+    return hipkittens_fused_moe_fp8(hidden, w1_fp8, w2_fp8, w1_scale, w2_scale, topk_w, topk_ids)
+
+
+def run_fp8_benchmark(batch_sizes, cfg):
+    """Run FP8 blockscale benchmark."""
+    print(f"\n{'='*70}")
+    print(f"HipKittens MoE FP8 Blockscale Benchmark")
+    print(f"Config: model_dim={cfg['model_dim']}, inter_dim={cfg['inter_dim']}")
+    print(f"        experts={cfg['num_experts']}, topk={cfg['topk']}")
+    print(f"        FP8 blockscale: {FP8_SCALE_BLOCK_N}x{FP8_SCALE_BLOCK_K}")
+    print(f"{'='*70}\n")
+    
+    results = []
+    for bs in batch_sizes:
+        print(f"\n--- Batch: {bs} tokens ---")
+        
+        try:
+            hidden, w1_bf16, w2_bf16, w1_fp8, w2_fp8, w1_scale, w2_scale, topk_w, topk_ids = create_fp8_inputs(bs, cfg)
+        except Exception as e:
+            print(f"  Setup failed: {e}")
+            continue
+        
+        flops = calc_flops(bs, cfg)
+        
+        # Reference: PyTorch with dequantized weights
+        try:
+            ref_out = torch_moe(hidden, w1_bf16, w2_bf16, topk_w, topk_ids, activation=ActivationType.Silu)
+        except Exception as e:
+            print(f"  PyTorch reference failed: {e}")
+            ref_out = None
+        
+        # HipKittens FP8
+        if HIPKITTENS_FP8_AVAILABLE:
+            try:
+                hk_fp8_out, hk_fp8_us = bench_hipkittens_fp8(hidden, w1_fp8, w2_fp8, w1_scale, w2_scale, topk_w, topk_ids)
+                hk_fp8_tf = flops / (hk_fp8_us * 1e-6) / 1e12
+                print(f"  HK FP8:     {hk_fp8_us:8.2f} us, {hk_fp8_tf:6.2f} TFLOPs")
+                
+                if ref_out is not None:
+                    mismatch = checkAllclose(
+                        ref_out, hk_fp8_out, rtol=0.05, atol=0.1, msg=f"batch={bs}", printLog=False
+                    )
+                    verdict = "PASS" if mismatch == 0 else f"WARN (mismatch={mismatch:.1%})"
+                    print(f"  Correctness vs PyTorch: {verdict}")
+            except Exception as e:
+                print(f"  HK FP8:     Failed - {e}")
+                hk_fp8_us, hk_fp8_tf = float('inf'), 0
+        else:
+            print(f"  HK FP8:     Not available")
+            hk_fp8_us, hk_fp8_tf = float('inf'), 0
+        
+        results.append({"batch": bs, "hk_fp8_us": hk_fp8_us, "hk_fp8_tf": hk_fp8_tf})
+    
+    print(f"\n{'='*70}")
+    print(f"{'Batch':>8} | {'HK FP8 (us)':>12} | {'TFLOPs':>8}")
+    print("-" * 35)
+    for r in results:
+        print(f"{r['batch']:>8} | {r['hk_fp8_us']:>12.2f} | {r['hk_fp8_tf']:>8.2f}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="HipKittens MoE Benchmark")
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=HIGH_BATCH_SIZES)
     parser.add_argument("--quick", action="store_true", help="Quick run")
+    parser.add_argument("--fp8", action="store_true", help="Run FP8 blockscale benchmark")
+    parser.add_argument("--deepseek-r1", action="store_true", help="Use DeepSeek R1 config (model_dim=7168, inter_dim=256, experts=256, topk=8)")
     args = parser.parse_args()
     
-    if args.quick:
-        run_benchmark([1024, 4096, 8192])
+    if args.fp8:
+        cfg = DEEPSEEK_R1_CONFIG if args.deepseek_r1 else MOE_CONFIG
+        if args.quick:
+            run_fp8_benchmark([512, 1024, 2048], cfg)
+        else:
+            run_fp8_benchmark(args.batch_sizes, cfg)
     else:
-        run_benchmark(args.batch_sizes)
+        if args.quick:
+            run_benchmark([1024, 4096, 8192])
+        else:
+            run_benchmark(args.batch_sizes)
 

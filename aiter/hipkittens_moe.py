@@ -12,10 +12,15 @@ Key optimizations:
 2. 8-wave ping-pong pattern for compute/memory overlap
 3. Expert-aware tiling to maximize weight reuse
 4. Coalesced memory accesses using buffer loads
+
+FP8 Blockscale Support:
+- Supports FP8 (e4m3fnuz) weights with per-block dequantization scales
+- Matches DeepSeek R1 production workload format (128x128 blocks)
+- On-the-fly dequantization in the kernel
 """
 
 import functools
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
@@ -28,6 +33,10 @@ from aiter.jit.core import compile_ops
 
 # Module name for the HipKittens MoE kernel
 _HK_MOE_MODULE = "module_hipkittens_moe"
+
+# FP8 blockscale configuration (matching DeepSeek R1)
+FP8_SCALE_BLOCK_N = 128
+FP8_SCALE_BLOCK_K = 128
 
 
 # Block size configurations for different batch sizes
@@ -294,3 +303,165 @@ def should_use_hipkittens_moe(
         return True
     
     return False
+
+
+# ============================================================================
+# FP8 Blockscale Interface
+# ============================================================================
+
+def compute_scale_dims(
+    n_dim: int,
+    k_dim: int,
+    scale_block_n: int = FP8_SCALE_BLOCK_N,
+    scale_block_k: int = FP8_SCALE_BLOCK_K,
+) -> Tuple[int, int]:
+    """Compute the scale tensor dimensions for blockscale quantization."""
+    num_scale_n = (n_dim + scale_block_n - 1) // scale_block_n
+    num_scale_k = (k_dim + scale_block_k - 1) // scale_block_k
+    return num_scale_n, num_scale_k
+
+
+@compile_ops(_HK_MOE_MODULE, fc_name="hk_fused_moe_fp8_fwd")
+def _hk_fused_moe_fp8_fwd_impl(
+    hidden_states: torch.Tensor,
+    w1_fp8: torch.Tensor,
+    w2_fp8: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    sorted_weights: torch.Tensor,
+    sorted_expert_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    topk: int,
+    block_m: int,
+) -> torch.Tensor:
+    """Internal implementation that triggers JIT compilation."""
+    pass
+
+
+def hipkittens_fused_moe_fp8(
+    hidden_states: torch.Tensor,
+    w1_fp8: torch.Tensor,  # [expert, inter_dim*2, model_dim] as FP8
+    w2_fp8: torch.Tensor,  # [expert, model_dim, inter_dim] as FP8
+    w1_scale: torch.Tensor,  # [expert, num_scale_n, num_scale_k]
+    w2_scale: torch.Tensor,  # [expert, num_scale_n, num_scale_k]
+    topk_weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_mask: Optional[torch.Tensor] = None,
+    activation: ActivationType = ActivationType.Silu,
+    block_size_M: Optional[int] = None,
+    num_local_tokens: Optional[torch.Tensor] = None,
+    moe_sorting_dispatch_policy: int = 0,
+) -> torch.Tensor:
+    """
+    HipKittens-based fused MoE forward pass with FP8 weights.
+    
+    This kernel supports FP8 quantized weights with per-block dequantization
+    scales, matching the DeepSeek R1 production workload format.
+    
+    Args:
+        hidden_states: Input tensor [num_tokens, model_dim] bf16
+        w1_fp8: Gate-Up projection [num_experts, inter_dim*2, model_dim] fp8
+        w2_fp8: Down projection [num_experts, model_dim, inter_dim] fp8
+        w1_scale: W1 scales [num_experts, ceil(N/128), ceil(K/128)] float
+        w2_scale: W2 scales [num_experts, ceil(N/128), ceil(K/128)] float
+        topk_weight: Routing weights [num_tokens, topk]
+        topk_ids: Expert assignments [num_tokens, topk]
+        expert_mask: Optional mask for expert parallelism
+        activation: Activation function (default: SiLU for G1U1)
+        block_size_M: Block size for M dimension (auto-selected if None)
+        num_local_tokens: For dynamic batching
+        moe_sorting_dispatch_policy: Sorting dispatch policy
+        
+    Returns:
+        Output tensor [num_tokens, model_dim] bf16
+    """
+    M, topk = topk_ids.shape
+    num_experts = w1_fp8.size(0)
+    model_dim = hidden_states.size(1)
+    inter_dim = w1_fp8.size(1) // 2  # G1U1
+    
+    # Auto-select block size based on batch size
+    if block_size_M is None:
+        block_size_M = get_hipkittens_block_m(M)
+    
+    # Force block_m=128 for correctness (see BF16 kernel comment)
+    if block_size_M != 128:
+        block_size_M = 128
+    
+    # Determine global expert count for EP
+    global_E = num_experts
+    if expert_mask is not None:
+        global_E = expert_mask.numel()
+    
+    dtype = hidden_states.dtype
+    assert dtype == dtypes.bf16, f"HipKittens MoE FP8 requires BFloat16 input, got {dtype}"
+    
+    # Verify G1U1 configuration
+    assert activation == ActivationType.Silu, "HipKittens MoE FP8 only supports SiLU activation"
+    
+    # Perform MoE sorting
+    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = hipkittens_moe_sorting(
+        topk_ids,
+        topk_weight,
+        global_E,
+        model_dim,
+        dtype,
+        block_size_M,
+        expert_mask,
+        num_local_tokens,
+        moe_sorting_dispatch_policy,
+    )
+    
+    # Call HipKittens fused MoE FP8 via JIT-compiled wrapper
+    output = _hk_fused_moe_fp8_fwd_impl(
+        hidden_states,
+        w1_fp8,
+        w2_fp8,
+        w1_scale,
+        w2_scale,
+        topk_weight,
+        topk_ids,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        topk,
+        block_size_M,
+    )
+    
+    return output
+
+
+@compile_ops(_HK_MOE_MODULE, fc_name="hk_moe_stage1_fp8_fwd")
+def hipkittens_moe_stage1_fp8(
+    hidden_states: torch.Tensor,
+    w1_fp8: torch.Tensor,
+    w1_scale: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    sorted_expert_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    topk: int,
+    block_m: int = 64,
+) -> torch.Tensor:
+    """
+    HipKittens MoE Stage 1 with FP8 weights: Gate-Up projection.
+    
+    Computes output = hidden_states @ W1^T with FP8 dequantization.
+    
+    Args:
+        hidden_states: Input [num_tokens, model_dim] bf16
+        w1_fp8: Gate-Up weights [num_experts, inter_dim*2, model_dim] fp8
+        w1_scale: Per-block scales [num_experts, num_scale_n, num_scale_k] float
+        sorted_ids: Sorted token IDs for expert routing
+        sorted_expert_ids: Expert assignment per tile
+        num_valid_ids: Valid token count per expert
+        topk: Number of experts per token
+        block_m: Block size for M dimension
+        
+    Returns:
+        Stage 1 output [num_tokens, topk, inter_dim*2]
+    """
+    pass
