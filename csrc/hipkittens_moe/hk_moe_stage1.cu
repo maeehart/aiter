@@ -1,14 +1,93 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 /**
- * HipKittens MoE Stage 1: Gate-Up Projection with MMA Instructions
- * 
- * Based on HipKittens GEMM patterns:
- * - Uses st_bf shared tiles + rt_bf/rt_fl register tiles
- * - mma_ABt for efficient matrix multiplication
- * - XCD-aware scheduling for L2 cache optimization
- * - 8-wave kernel pattern (512 threads)
- * 
+ * HipKittens MoE Stage 1: Gate-Up projection (G1U1) implemented as a tiled GEMM with a gathered A operand.
+ *
+ * -----------------------------------------------------------------------------------------------
+ * ## 1) High-level computation (math)
+ *
+ * Inputs / outputs:
+ *   - hidden_states[token, k]   ∈ bf16, shape [num_tokens, model_dim]
+ *   - w1[expert, n, k]          ∈ bf16, shape [num_experts, 2*inter_dim, model_dim]
+ *   - intermediate[row, n]      ∈ bf16, shape [sorted_M, 2*inter_dim]
+ *
+ * Each `row` corresponds to one routed token instance (token_id + topk slot) after MoE sorting.
+ *
+ * For each valid sorted row and output column:
+ *
+ *   token_id(row) = sorted_ids[row] & 0x00FFFFFF
+ *   expert(row)   = sorted_expert_ids[ row_start / block_m_sorting ]
+ *
+ *   intermediate[row, n] = Σ_{k=0..model_dim-1} hidden_states[token_id(row), k] * w1[expert(row), n, k]
+ *                         for n ∈ [0, 2*inter_dim)
+ *
+ * This is a GEMM over (M, N, K) = (sorted_M_valid, 2*inter_dim, model_dim).
+ *
+ * -----------------------------------------------------------------------------------------------
+ * ## 2) Tiling (what a workgroup computes)
+ *
+ * Workgroup output tile:
+ *   - BLOCK_SIZE = 128
+ *   - C_tile is 128×128 over (M,N)
+ *
+ * K is iterated in tiles:
+ *   - K_STEP = 32
+ *   - Each iteration accumulates over K_STEP elements.
+ *
+ * Therefore (per K iteration):
+ *   - A_shmem tile is [128, 32] bf16
+ *   - B_shmem tile is [128, 32] bf16 (B is logically [N,K], but stored as [N,K_STEP] in LDS)
+ *
+ * -----------------------------------------------------------------------------------------------
+ * ## 3) Warp mapping (how the 8 warps cover the tile)
+ *
+ * Workgroup has 512 threads = 8 warps × 64 lanes (HipKittens “8-wave” pattern).
+ * Warps are arranged as a 2×4 grid:
+ *   warp_row = warpid()/4  ∈ {0,1}          selects which 64-row half of the 128 M rows
+ *   warp_col = warpid()%4  ∈ {0,1,2,3}      selects which 32-col quarter of the 128 N cols
+ *
+ * Each warp computes a 64×32 slab via two 32×32 fp32 accumulators:
+ *   C_accum[0] covers rows [warp_row*64 + 0 .. +31], cols [warp_col*32 .. +31]
+ *   C_accum[1] covers rows [warp_row*64 +32 .. +63], cols [warp_col*32 .. +31]
+ *
+ * -----------------------------------------------------------------------------------------------
+ * ## 4) Validity / padding (correctness invariant)
+ *
+ * The MoE sorting pass produces padded arrays. We must never read/write past valid rows:
+ *   sorted_M_valid := num_valid_ids[0]
+ * Rows >= sorted_M_valid are padding and must act as zeros.
+ *
+ * -----------------------------------------------------------------------------------------------
+ * ## 5) Cache + LDS sizing (why these choices matter)
+ *
+ * Per workgroup, per K tile:
+ *   A bytes  ≈ 128 * 32 * 2  = 8192 bytes  (gathered; often low coalescing)
+ *   B bytes  ≈ 128 * 32 * 2  = 8192 bytes  (contiguous; reuse is the main locality target)
+ *
+ * LDS footprint per workgroup (approx, ignoring swizzle padding):
+ *   sizeof(st_bf<128,32>) ≈ 128*32*2 = 8192 bytes
+ *   As  : 1 × 8192
+ *   Bs0 : 1 × 8192   (ping)
+ *   Bs1 : 1 × 8192   (pong)
+ *   token_row_offsets[128] : 128 × 4 = 512
+ * Total ≈ 24.5 KB (+ allocator alignment/padding).
+ *
+ * Occupancy intuition:
+ *   Lower LDS per block makes it easier to fit 2 blocks/CU (if VGPR allows), which is why K_STEP=32
+ *   is an attractive baseline versus K_STEP=64 (which doubles tile bytes).
+ *
+ * -----------------------------------------------------------------------------------------------
+ * ## 6) Synchronization and waitcnt (why they exist)
+ *
+ * - __syncthreads():
+ *   Ensure all threads finished writing LDS tiles before any warp reads subtiles for MFMA.
+ *
+ * - s_waitcnt lgkmcnt(0):
+ *   Ensure LDS->VGPR reads issued by HipKittens `load(...)` complete before MFMA consumes a_tile/b_tile.
+ *
+ * - s_waitcnt vmcnt(0):
+ *   Ensure VMEM reads (raw buffer loads) complete before committing prefetched values into LDS.
+ *
  * Reference: https://hazyresearch.stanford.edu/blog/2025-11-09-amd-brr
  */
 
@@ -16,8 +95,8 @@
 
 using namespace kittens;
 
-// Configuration following HipKittens GEMM pattern
-// K_STEP=64 to match AITER CK configuration
+// Configuration following HipKittens GEMM pattern.
+// NOTE: historical experiments used K_STEP=64; current stable baseline uses K_STEP=32.
 namespace s1_cfg {
     constexpr int BLOCK_SIZE = 128;   // Output tile size (M and N dimension of output tile)
     constexpr int K_STEP = 32;        // K dimension per iteration (stable baseline)
@@ -33,8 +112,9 @@ namespace s1_cfg {
     constexpr int WGM = 4;            // Workgroup grouping factor for L2 locality
 }
 
-// Shared tile types for input and weight
-using s1_st_tile = st_bf<s1_cfg::BLOCK_SIZE, s1_cfg::K_STEP>;  // [128, 64] shared bf16 tile
+// Shared tile type for input and weight.
+// st_bf is stored in LDS with a swizzled layout; write via store_shared_vec(tile.idx(...)) to preserve swizzle.
+using s1_st_tile = st_bf<s1_cfg::BLOCK_SIZE, s1_cfg::K_STEP>;  // [128, 32] bf16 tile in LDS
 
 // Group for cooperative loading
 using s1_group = group<s1_cfg::NUM_WARPS>;

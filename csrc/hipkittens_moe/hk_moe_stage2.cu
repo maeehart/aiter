@@ -1,15 +1,69 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 /**
- * HipKittens MoE Stage 2: Down Projection with Weighted Accumulation
- * 
- * Based on HipKittens GEMM patterns:
- * - Uses st_bf shared tiles + rt_bf/rt_fl register tiles  
- * - mma_ABt for efficient matrix multiplication
- * - XCD-aware scheduling for L2 cache optimization
- * - 8-wave kernel pattern (512 threads)
- * - Weighted scatter-add to output
- * 
+ * HipKittens MoE Stage 2: Down projection + weighted accumulation (GEMM + scatter-add).
+ *
+ * Stage 2 consumes the activated values from Stage 1 (the first half of the G1U1 buffer) and applies:
+ *
+ *   w2[expert, out, k] ∈ bf16, shape [num_experts, model_dim, inter_dim]
+ *
+ * to produce the final output:
+ *
+ *   output[token, out] = Σ_{(row routed to token)} weight(row) * Σ_{k=0..inter_dim-1} act[row, k] * w2[expert(row), out, k]
+ *
+ * where:
+ *   - row is a sorted routed instance (token_id + topk slot)
+ *   - weight(row) is the routing probability / gate weight for that routed instance
+ *
+ * -----------------------------------------------------------------------------------------------
+ * ## 1) Inputs / outputs / addressing
+ *
+ * Inputs:
+ *   - intermediate[row, :] is laid out as Stage1's [sorted_M, 2*inter_dim] buffer.
+ *     Stage2 reads only the activated first half (inter_dim columns) using a row stride:
+ *
+ *       act_ptr(row, k) = intermediate + row * inter_row_stride + k
+ *       inter_row_stride = 2*inter_dim (elements)
+ *
+ *   - sorted_ids[row] packs token_id in low 24 bits.
+ *   - sorted_weights[row] is float32.
+ *   - sorted_expert_ids[tile_id] gives expert for a tile of rows.
+ *   - num_valid_ids[0] = sorted_M_valid.
+ *
+ * Output:
+ *   - output_fp32[token, out] is float32 so atomics accumulate without bf16 rounding.
+ *
+ * -----------------------------------------------------------------------------------------------
+ * ## 2) GEMM view (per expert tile)
+ *
+ * Conceptually per expert segment we do:
+ *
+ *   C = A * B^T
+ *
+ *   A: [M=sorted_rows_for_expert, K=inter_dim]  (activated)
+ *   B: [N=model_dim, K=inter_dim]              (w2 for that expert)
+ *   C: [M, N]
+ *
+ * Then we scatter each C[row, out] into output[token_id(row), out] with scaling by weight(row).
+ *
+ * -----------------------------------------------------------------------------------------------
+ * ## 3) Tiling / bytes / cache model
+ *
+ * Workgroup output tile is again 128×128 over (M,N), with K_STEP=32:
+ *   - A_shmem: [128, 32] bf16 => 8 KB
+ *   - B_shmem: [128, 32] bf16 => 8 KB
+ *   - C in registers (fp32)
+ *
+ * Stage2 differs from Stage1 in the *scatter*:
+ *   - Writes are atomicAdd to output_fp32 using token_id indirection.
+ *   - For topk>1 multiple rows map to same token; atomics serialize those collisions.
+ *
+ * -----------------------------------------------------------------------------------------------
+ * ## 4) Synchronization / correctness
+ *
+ * - __syncthreads(): barrier between cooperative LDS stores and LDS loads for MFMA.
+ * - s_waitcnt lgkmcnt(0): ensure LDS->VGPR loads complete before MFMA.
+ *
  * Reference: https://hazyresearch.stanford.edu/blog/2025-11-09-amd-brr
  */
 
@@ -17,8 +71,8 @@
 
 using namespace kittens;
 
-// Configuration following HipKittens GEMM pattern
-// Match AITER CK configuration: K_STEP=64 for fewer iterations
+// Configuration following HipKittens GEMM pattern.
+// NOTE: current stable baseline uses K_STEP=32 (occupancy-friendly).
 namespace s2_cfg {
     constexpr int BLOCK_SIZE = 128;   // Output tile size
     constexpr int K_STEP = 32;        // K dimension per iteration (stable baseline)
