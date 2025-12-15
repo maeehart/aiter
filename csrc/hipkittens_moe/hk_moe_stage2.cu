@@ -151,6 +151,23 @@
  * [TODO] 9) Consider fp32 accumulation earlier
  *    - With FP8 weights, accumulation precision is more critical.
  *    - Current: accumulate in fp32 registers (good), atomic to fp32 output (good).
+ *
+ * === rocprof Hardware Counter Analysis (8k batch, DeepSeek R1) ===
+ *
+ * Stage 2 FP8 kernel vs Stage 1 FP8 Fused:
+ *   - Stage 2 launches 28x more waves (344K vs 12K)
+ *   - Stage 2 has worse MFMA/VALU ratio: 7.7% vs 13.6%
+ *   - Stage 2 has 2.4x more VMEM instructions (33M vs 14M)
+ *   - Stage 2 uses fewer VGPRs (76 vs 120) but more LDS (32KB vs 25KB)
+ *
+ * Key bottleneck: Stage 2 is more memory-bound and less compute-efficient.
+ * Wave count is high because each 128x128 output tile is small relative to
+ * total output [sorted_M, model_dim] = [65K, 7168], requiring ~550 N-tiles.
+ *
+ * Potential optimizations:
+ *   1) Reduce wave count via larger N-tiles (256 instead of 128)
+ *   2) Reduce VALU overhead by simplifying address calculations
+ *   3) Reduce VMEM by improving weight reuse across K iterations
  */
 #include "hk_moe_kernel.cuh"
 
