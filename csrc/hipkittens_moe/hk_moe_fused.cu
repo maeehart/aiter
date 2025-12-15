@@ -670,17 +670,17 @@ void hk_moe_streaming_fp8_kernel(
     // LDS ALLOCATION (sequential, non-overlapping)
     // =========================================================================
     // As:        st_bf<32, 32>  - for hidden input / intermediate copy
-    // W1s:       st_bf<32, 32>  - for W1_gate or W1_up weights
-    // inter_lds: bf16[32][32]   - raw 2D array for intermediate results
+    // W1s:       st_bf<32, 32>  - for W1_gate or W1_up weights  
     // W2s:       st_bf<128, 32> - for W2 weights
+    // inter_lds: bf16[32][32]   - raw 2D array for intermediate results
     // token_row_offsets: int[32] - precomputed hidden_states offsets
     
-    stream_input_tile (&As) = al.allocate<stream_input_tile>();
-    stream_w1_tile (&W1s) = al.allocate<stream_w1_tile>();
+    stream_input_tile (&As) = al.allocate<stream_input_tile>();      // offset 0, size 2KB
+    stream_w1_tile (&W1s) = al.allocate<stream_w1_tile>();           // offset 2KB, size 2KB
+    stream_w2_tile (&W2s) = al.allocate<stream_w2_tile>();           // offset 4KB, size 8KB
     bf16 (*inter_lds)[K_INTER] = reinterpret_cast<bf16(*)[K_INTER]>(al.ptr);
-    al.ptr += M_TILE * K_INTER * sizeof(bf16);
-    stream_w2_tile (&W2s) = al.allocate<stream_w2_tile>();
-    int* token_row_offsets = (int*)al.allocate<int[M_TILE]>();
+    al.ptr += M_TILE * K_INTER * sizeof(bf16);                       // offset 12KB, size 2KB
+    int* token_row_offsets = (int*)al.allocate<int[M_TILE]>();       // offset 14KB, size 128B
     
     // =========================================================================
     // WORKGROUP POSITION
@@ -690,7 +690,14 @@ void hk_moe_streaming_fp8_kernel(
     
     int wgid = (blockIdx.y * gridDim.x) + blockIdx.x;
     const int NUM_WGS = gridDim.x * gridDim.y;
-    wgid = fused_xcd_transform(wgid, NUM_WGS);  // XCD-aware scheduling
+    
+    // NOTE: XCD transform disabled for now - causes correctness issues
+    // The transform reorders workgroups for better cache utilization but
+    // interacts badly with the streaming kernel's data dependencies
+    // TODO: Investigate proper XCD handling for streaming kernel
+    // if (NUM_WGS >= 128) {
+    //     wgid = fused_xcd_transform(wgid, NUM_WGS);
+    // }
     if (wgid >= NUM_WGS) return;
     
     const int pid_m = wgid / num_n_blocks;      // Which M-tile (row block)
