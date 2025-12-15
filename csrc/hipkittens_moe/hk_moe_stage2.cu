@@ -76,7 +76,7 @@
  *
  * The checklist below is ordered from "simplest conceptual simplification" to "bigger redesign".
  *
- * [HIGH PRIORITY] 1) Make token writes unique by writing to a per-(token, topk_slot) buffer (remove atomics entirely)
+ * [IMPLEMENTING] 1) Make token writes unique by writing to a per-(token, topk_slot) buffer (remove atomics entirely)
  *    - Key observation: each routed row corresponds to one (token_id, topk_slot) pair.
  *      If `sorted_ids[row]` encodes the topk slot (common in MoE packings), then Stage2 can write:
  *
@@ -141,10 +141,9 @@
 using namespace kittens;
 
 // Configuration following HipKittens GEMM pattern.
-// NOTE: current stable baseline uses K_STEP=32 (occupancy-friendly).
 namespace s2_cfg {
     constexpr int BLOCK_SIZE = 128;   // Output tile size
-    constexpr int K_STEP = 32;        // K dimension per iteration (stable baseline)
+    constexpr int K_STEP = 32;        // K dimension per iteration
     constexpr int REG_BLOCK = BLOCK_SIZE / 4;  // 32
     constexpr int DOT_SLICE = 16;     // MMA native dimension
     
@@ -152,8 +151,7 @@ namespace s2_cfg {
     constexpr int NUM_THREADS = WARP_THREADS * NUM_WARPS;  // 512
     
     // XCD-aware scheduling parameters
-    // TODO: Use template programming to tune WGM per batch size
-    constexpr int WGM = 4;
+    constexpr int WGM = 8;
 }
 
 // Shared tile types
@@ -679,7 +677,7 @@ void dispatch_hk_moe_stage2_fp8(const moe_stage2_fp8_globals& g, float* output_f
     dim3 grid(num_n_blocks, num_m_blocks);
     dim3 block(NUM_THREADS);
     
-    size_t smem_size = 32768;
+    size_t smem_size = 32768;  // 32KB for K_STEP=32
     hipFuncSetAttribute((void*)hk_moe_stage2_fp8_kernel_mma, 
                         hipFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     
