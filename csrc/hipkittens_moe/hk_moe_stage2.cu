@@ -1005,7 +1005,7 @@ void dispatch_hk_moe_stage2_fp8_noatomic(
         dim3 grid(num_n_blocks, num_m_blocks);
         dim3 block(NUM_THREADS);
         
-        size_t smem_size = 32768;
+        size_t smem_size = 32768;  // 32KB for K_STEP=32
         hipFuncSetAttribute((void*)hk_moe_stage2_fp8_noatomic_kernel_mma, 
                             hipFuncAttributeMaxDynamicSharedMemorySize, smem_size);
         

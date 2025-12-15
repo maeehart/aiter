@@ -43,6 +43,7 @@ try:
         hipkittens_fused_moe_fp8,
         hipkittens_fused_moe_fp8_fused_act,
         hipkittens_fused_moe_fp8_noatomic,
+        hipkittens_fused_moe_fully_fused,
     )
     HIPKITTENS_AVAILABLE = True
     HIPKITTENS_FP8_AVAILABLE = True
@@ -99,6 +100,15 @@ def create_inputs(batch_size, cfg, dtype=torch.bfloat16, device="cuda"):
 @perftest()
 def bench_aiter(hidden, w1, w2, topk_w, topk_ids):
     return fused_moe(hidden, w1, w2, topk_w, topk_ids, activation=ActivationType.Silu, quant_type=QuantType.No)
+
+
+@perftest()
+def bench_aiter_fp8(hidden, w1_fp8, w2_fp8, w1_scale, w2_scale, topk_w, topk_ids):
+    """Benchmark AITER production FP8 blockscale kernel."""
+    return fused_moe(hidden, w1_fp8, w2_fp8, topk_w, topk_ids, 
+                     activation=ActivationType.Silu, 
+                     quant_type=QuantType.per_128x128,
+                     w1_scale=w1_scale, w2_scale=w2_scale)
 
 
 @perftest()
@@ -263,7 +273,12 @@ def bench_hipkittens_fp8_noatomic(hidden, w1_fp8, w2_fp8, w1_scale, w2_scale, to
     return hipkittens_fused_moe_fp8_noatomic(hidden, w1_fp8, w2_fp8, w1_scale, w2_scale, topk_w, topk_ids)
 
 
-def run_fp8_benchmark(batch_sizes, cfg, compare_fused_act=True, compare_noatomic=False):
+@perftest()
+def bench_hipkittens_fp8_fully_fused(hidden, w1_fp8, w2_fp8, w1_scale, w2_scale, topk_w, topk_ids):
+    return hipkittens_fused_moe_fully_fused(hidden, w1_fp8, w2_fp8, w1_scale, w2_scale, topk_w, topk_ids)
+
+
+def run_fp8_benchmark(batch_sizes, cfg, compare_fused_act=True, compare_noatomic=False, compare_fully_fused=False):
     """Run FP8 blockscale benchmark.
     
     Args:
@@ -302,6 +317,22 @@ def run_fp8_benchmark(batch_sizes, cfg, compare_fused_act=True, compare_noatomic
         
         hk_fp8_us, hk_fp8_tf = float('inf'), 0
         hk_fused_us, hk_fused_tf = float('inf'), 0
+        aiter_fp8_us, aiter_fp8_tf = float('inf'), 0
+        
+        # AITER production FP8 (baseline)
+        try:
+            aiter_fp8_out, aiter_fp8_us = bench_aiter_fp8(hidden, w1_fp8, w2_fp8, w1_scale, w2_scale, topk_w, topk_ids)
+            aiter_fp8_tf = flops / (aiter_fp8_us * 1e-6) / 1e12
+            print(f"  AITER FP8:      {aiter_fp8_us:8.2f} us, {aiter_fp8_tf:6.2f} TFLOPs")
+            
+            if ref_out is not None:
+                mismatch = checkAllclose(
+                    ref_out, aiter_fp8_out, rtol=0.05, atol=0.1, msg=f"batch={bs}", printLog=False
+                )
+                verdict = "PASS" if mismatch == 0 else f"WARN (mismatch={mismatch:.1%})"
+                print(f"    Correctness: {verdict}")
+        except Exception as e:
+            print(f"  AITER FP8:      Failed - {e}")
         
         # HipKittens FP8 (non-fused)
         if HIPKITTENS_FP8_AVAILABLE:
@@ -354,26 +385,55 @@ def run_fp8_benchmark(batch_sizes, cfg, compare_fused_act=True, compare_noatomic
             except Exception as e:
                 print(f"  HK NoAtomic:    Failed - {e}")
         
+        # HipKittens FP8 Fully Fused (Stage1+Stage2 in single kernel)
+        hk_fullyfused_us, hk_fullyfused_tf = float('inf'), 0
+        if compare_fully_fused and HIPKITTENS_FP8_AVAILABLE:
+            try:
+                hk_fullyfused_out, hk_fullyfused_us = bench_hipkittens_fp8_fully_fused(hidden, w1_fp8, w2_fp8, w1_scale, w2_scale, topk_w, topk_ids)
+                hk_fullyfused_tf = flops / (hk_fullyfused_us * 1e-6) / 1e12
+                speedup_vs_fused = hk_fused_us / hk_fullyfused_us if hk_fullyfused_us > 0 else 0
+                print(f"  HK FullyFused:  {hk_fullyfused_us:8.2f} us, {hk_fullyfused_tf:6.2f} TFLOPs ({speedup_vs_fused:.2f}x vs fused)")
+                
+                if ref_out is not None:
+                    mismatch = checkAllclose(
+                        ref_out, hk_fullyfused_out, rtol=0.05, atol=0.1, msg=f"batch={bs}", printLog=False
+                    )
+                    verdict = "PASS" if mismatch == 0 else f"WARN (mismatch={mismatch:.1%})"
+                    print(f"    Correctness: {verdict}")
+                    if mismatch > 0:
+                        # Debug: show more info about the mismatch
+                        nan_count = torch.isnan(hk_fullyfused_out).sum().item()
+                        inf_count = torch.isinf(hk_fullyfused_out).sum().item()
+                        if nan_count > 0:
+                            print(f"    DEBUG: NaN count={nan_count}, Inf count={inf_count}")
+                            print(f"    DEBUG: Output mean={hk_fullyfused_out.nanmean().item():.6f}, std={hk_fullyfused_out.std().item():.6f}")
+            except Exception as e:
+                print(f"  HK FullyFused:  Failed - {e}")
+                import traceback
+                traceback.print_exc()
+        
         results.append({
             "batch": bs, 
+            "aiter_fp8_us": aiter_fp8_us, "aiter_fp8_tf": aiter_fp8_tf,
             "hk_fp8_us": hk_fp8_us, "hk_fp8_tf": hk_fp8_tf,
             "hk_fused_us": hk_fused_us, "hk_fused_tf": hk_fused_tf,
             "hk_noatomic_us": hk_noatomic_us, "hk_noatomic_tf": hk_noatomic_tf,
+            "hk_fullyfused_us": hk_fullyfused_us, "hk_fullyfused_tf": hk_fullyfused_tf,
         })
     
     print(f"\n{'='*80}")
-    print("SUMMARY: HipKittens vs AITER Production (from CSV)")
+    print("SUMMARY: HipKittens vs AITER Production (LIVE comparison)")
     print("-" * 80)
-    print(f"{'Batch':>8} | {'AITER (us)':>10} | {'HK Fused (us)':>12} | {'Gap':>8} | {'TFLOPs':>7}")
+    print(f"{'Batch':>8} | {'AITER (us)':>10} | {'HK Fused (us)':>12} | {'Gap':>8} | {'HK TFLOPs':>10}")
     print("-" * 80)
     for r in results:
-        aiter_ns = AITER_CSV_TIMINGS_NS.get(r['batch'])
-        if aiter_ns and r['hk_fused_us'] < float('inf'):
-            aiter_us = aiter_ns / 1000.0
-            gap = r['hk_fused_us'] / aiter_us
-            print(f"{r['batch']:>8} | {aiter_us:>10.2f} | {r['hk_fused_us']:>12.2f} | {gap:>7.2f}x | {r['hk_fused_tf']:>7.2f}")
-        elif r['hk_fused_us'] < float('inf'):
-            print(f"{r['batch']:>8} | {'N/A':>10} | {r['hk_fused_us']:>12.2f} | {'N/A':>8} | {r['hk_fused_tf']:>7.2f}")
+        aiter_us = r.get('aiter_fp8_us', float('inf'))
+        hk_us = r.get('hk_fused_us', float('inf'))
+        if aiter_us < float('inf') and hk_us < float('inf'):
+            gap = hk_us / aiter_us
+            print(f"{r['batch']:>8} | {aiter_us:>10.2f} | {hk_us:>12.2f} | {gap:>7.2f}x | {r['hk_fused_tf']:>10.2f}")
+        elif hk_us < float('inf'):
+            print(f"{r['batch']:>8} | {'N/A':>10} | {hk_us:>12.2f} | {'N/A':>8} | {r['hk_fused_tf']:>10.2f}")
     
     print(f"\n{'='*80}")
     print("Note: Gap > 1.0x means HipKittens is slower than AITER production.")
@@ -443,6 +503,7 @@ if __name__ == "__main__":
     parser.add_argument("--deepseek-r1", action="store_true", help="Use DeepSeek R1 config (model_dim=7168, inter_dim=256, experts=256, topk=8)")
     parser.add_argument("--profile-stages", action="store_true", help="Profile Stage1 vs Stage2 timing")
     parser.add_argument("--noatomic", action="store_true", help="Also benchmark atomic-free Stage 2 variant")
+    parser.add_argument("--fully-fused", action="store_true", help="Also benchmark fully fused (Stage1+Stage2) kernel")
     args = parser.parse_args()
     
     if args.profile_stages:
@@ -451,9 +512,9 @@ if __name__ == "__main__":
     elif args.fp8:
         cfg = DEEPSEEK_R1_CONFIG if args.deepseek_r1 else MOE_CONFIG
         if args.quick:
-            run_fp8_benchmark([512, 1024, 2048], cfg, compare_noatomic=args.noatomic)
+            run_fp8_benchmark([512, 1024, 2048], cfg, compare_noatomic=args.noatomic, compare_fully_fused=args.fully_fused)
         else:
-            run_fp8_benchmark(args.batch_sizes, cfg, compare_noatomic=args.noatomic)
+            run_fp8_benchmark(args.batch_sizes, cfg, compare_noatomic=args.noatomic, compare_fully_fused=args.fully_fused)
     else:
         if args.quick:
             run_benchmark([1024, 4096, 8192])
