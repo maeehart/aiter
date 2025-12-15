@@ -568,7 +568,7 @@ namespace stream_cfg {
     constexpr int M_TILE = 32;         // Rows per workgroup  
     constexpr int N_TILE = 128;        // Output columns per workgroup
     constexpr int K_STEP = 64;         // K dimension per iteration (for model_dim) - optimal balance
-    constexpr int K_INTER = 32;        // Inter_dim chunk size (K of Stage 2)
+    constexpr int K_INTER = 64;        // Inter_dim chunk size - 64 is optimal (128 exceeds LDS)
     
     constexpr int REG_M = 16;          // Each warp handles 16 rows
     constexpr int REG_N = 64;          // Each warp handles 64 output columns
