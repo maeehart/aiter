@@ -67,6 +67,61 @@
  * Reference: https://hazyresearch.stanford.edu/blog/2025-11-09-amd-brr
  */
 
+/*
+ * === Opportunity checklist (Stage2: simplify + reduce/remove atomics) ===
+ *
+ * Stage2 is dominated by two structural costs:
+ *   (a) GEMM is fine (MFMA-heavy), but
+ *   (b) scatter-add is hard: token_id indirection + atomic collisions.
+ *
+ * The checklist below is ordered from "simplest conceptual simplification" to "bigger redesign".
+ *
+ * 1) Make token writes unique by writing to a per-(token, topk_slot) buffer (remove atomics entirely)
+ *    - Key observation: each routed row corresponds to one (token_id, topk_slot) pair.
+ *      If `sorted_ids[row]` encodes the topk slot (common in MoE packings), then Stage2 can write:
+ *
+ *        tmp[token_id, slot, out] = weight(row) * C[row, out]        (no atomic; unique destination)
+ *
+ *      followed by a simple reduction kernel:
+ *
+ *        output[token, out] = Σ_{slot=0..topk-1} tmp[token, slot, out]
+ *
+ *      Why this helps:
+ *        - the reduction is dense and fully coalesced
+ *        - removes atomic hot-spots completely
+ *      Cost:
+ *        - extra tmp buffer of size [num_tokens, topk, model_dim] (bf16 or fp32)
+ *        - one additional reduction kernel (but extremely regular)
+ *
+ * 2) Two-pass “no-atomic Stage2”: write per-row output, then segmented reduce by token_id
+ *    - Pass A: produce row-major output:
+ *        row_out[row, out] = weight(row) * C[row, out]               (no atomic)
+ *      Pass B: reduce by token_id(row) using a segmented reduction kernel.
+ *    - This is a generalization of (1) when topk slot isn't available or when you want fp32 accumulation.
+ *    - Cost: large temporary [sorted_M_valid, model_dim] and extra pass.
+ *
+ * 3) Reduce atomics by local aggregation (warp/block hash) before issuing atomicAdd
+ *    - Within a warp (or a block), group lanes that target the same token_id and sum locally,
+ *      then issue one atomic per unique token_id per output column.
+ *    - This can significantly reduce atomics if token_id collisions are common within a CTA's 128-row tile.
+ *    - Complexity: requires a grouping strategy (e.g., small shared-memory hash table or sort-by-token inside tile).
+ *
+ * 4) Change accumulation granularity: per-expert partial outputs then final combine
+ *    - Within a single expert segment, each token typically appears at most once (for topk routing with unique ids).
+ *      Stage2 can write a per-expert partial output without atomics:
+ *        out_expert[expert, token, out] += weight * C
+ *      Then combine across experts per token in a second kernel.
+ *    - This trades atomics for memory footprint; may be attractive if collisions dominate.
+ *
+ * 5) Tighten invariants and remove redundant checks / branches
+ *    - Similar to Stage1: for common shapes, many bounds checks are redundant.
+ *    - Ensure all bounds use sorted_M_valid, and consider padding inter_dim to K_STEP and VEC_SIZE.
+ *
+ * 6) If we keep atomics: make them cheaper
+ *    - Keep output_fp32 but consider:
+ *        - reordering work to increase spatial locality (token clustering) so atomics hit fewer cache lines
+ *        - using larger tiles over N to amortize metadata loads (sorted_ids/weights)
+ */
 #include "hk_moe_kernel.cuh"
 
 using namespace kittens;

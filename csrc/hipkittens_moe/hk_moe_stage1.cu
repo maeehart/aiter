@@ -91,6 +91,55 @@
  * Reference: https://hazyresearch.stanford.edu/blog/2025-11-09-amd-brr
  */
 
+/*
+ * === Opportunity checklist (Stage1: simplify + speed levers) ===
+ *
+ * This section is intentionally "engineering actionable": each item is phrased as a concrete change
+ * we can try, and why it might simplify the approach or remove unnecessary work.
+ *
+ * 1) Eliminate boundary slow-paths via padding + invariants
+ *    - For common production shapes (model_dim=4096, inter_dim=4096, topk=2):
+ *        model_dim is divisible by 32 and 8, and total_n=2*inter_dim is divisible by 128.
+ *      If we treat these as invariants (or pad to them), we can remove many inner-loop bounds checks
+ *      and scalar fallback paths, simplifying the code and reducing VALU/control overhead.
+ *
+ * 2) Fuse activation to remove the separate activation kernel and halve intermediate bandwidth
+ *    - Today Stage1 writes gate|up to global, then another kernel computes:
+ *        act = silu(gate) * up
+ *      and writes act back into the first half.
+ *    - A simplification path is to compute act inside Stage1 and write only act (inter_dim columns).
+ *      Benefits:
+ *        - remove the activation kernel launch
+ *        - remove global write of the gate half entirely
+ *        - reduce intermediate global traffic ~2×
+ *      Cost:
+ *        - adds elementwise nonlinearity + multiply in Stage1's epilogue (but may still be net win).
+ *
+ * 3) Make “valid rows” semantics explicit and uniform
+ *    - Prefer `sorted_M_valid` for all row bounds. Any use of `sorted_M` in the hot path risks reading padding
+ *      and wasting bandwidth / generating non-deterministic behavior if padding isn't fully zeroed.
+ *
+ * 4) Remove redundant per-row metadata work
+ *    - Stage1 is sensitive to front-end work (packed_id decode, token_id*model_dim, pointer math).
+ *    - We already precompute token_row_offsets in LDS; further simplification options:
+ *        - also cache packed_id for the block (token_id + topk slot) if reused in epilogue
+ *        - precompute byte offsets (for buffer loads) once per row if it removes repeated mul/add
+ *
+ * 5) Re-evaluate the w1 prefetch pipeline complexity
+ *    - If profiling shows the buffer-load prefetch does not overlap meaningfully (e.g. because gather latency
+ *      dominates or barriers prevent overlap), the simplest implementation (direct load->LDS) may be best.
+ *    - If it does help, ensure the pipeline is “structurally CK-like”:
+ *        prefetch next B while MFMA runs, minimize bookkeeping, and avoid extra barriers.
+ *
+ * 6) Threadblock shape / warp count
+ *    - CK often uses 256 threads for similar tiles. A 512-thread block may inflate overhead (sync, LDS traffic,
+ *      scheduler pressure). Trying a 4-warp variant could simplify mapping and improve occupancy.
+ *
+ * 7) Simplify expert_id lookup
+ *    - Today we derive expert_id from row_start/block_m_sorting and rely on block_m_sorting==128.
+ *      A simpler contract would produce expert_id per 128-row kernel tile directly during sorting so the kernel
+ *      doesn't need to reason about block_m_sorting at all.
+ */
 #include "hk_moe_kernel.cuh"
 
 using namespace kittens;
