@@ -1088,7 +1088,8 @@
             "f'{AITER_CSRC_DIR}/pybind/hipkittens_moe_pybind.cu'",
             "f'{AITER_CSRC_DIR}/hipkittens_moe/hk_moe_torch.cu'",
             "f'{AITER_CSRC_DIR}/hipkittens_moe/hk_moe_stage1.cu'",
-            "f'{AITER_CSRC_DIR}/hipkittens_moe/hk_moe_stage2.cu'"
+            "f'{AITER_CSRC_DIR}/hipkittens_moe/hk_moe_stage2.cu'",
+            "f'{AITER_CSRC_DIR}/hipkittens_moe/hk_moe_fused.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [

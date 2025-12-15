@@ -715,3 +715,126 @@ def hipkittens_fused_moe_fp8_noatomic(
     )
     
     return output
+
+
+# ============================================================================
+# Fully Fused Kernel (Stage1 + Stage2 in one kernel)
+# ============================================================================
+
+@compile_ops(_HK_MOE_MODULE, fc_name="hk_fused_moe_fully_fused_fwd")
+def _hk_fused_moe_fully_fused_fwd_impl(
+    hidden_states: torch.Tensor,
+    w1_fp8: torch.Tensor,
+    w2_fp8: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    sorted_weights: torch.Tensor,
+    sorted_expert_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    topk: int,
+    block_m: int,
+) -> torch.Tensor:
+    """Internal implementation wrapper for fully fused kernel."""
+    pass
+
+
+def hipkittens_fused_moe_fully_fused(
+    hidden_states: torch.Tensor,
+    w1_fp8: torch.Tensor,
+    w2_fp8: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_mask: Optional[torch.Tensor] = None,
+    activation: ActivationType = ActivationType.Silu,
+    block_size_M: Optional[int] = None,
+    num_local_tokens: Optional[torch.Tensor] = None,
+    moe_sorting_dispatch_policy: int = 0,
+) -> torch.Tensor:
+    """
+    HipKittens FULLY FUSED MoE forward pass.
+    
+    Fuses Stage 1 (gate-up + SiLU) and Stage 2 (down projection) into a single kernel.
+    Intermediate values stay in LDS, never going to global memory.
+    
+    Memory savings vs separate kernels (hipkittens_fused_moe_fp8_fused_act):
+      - Eliminates intermediate write: sorted_M × inter_dim × 2B (~35MB at 8k batch)
+      - Eliminates intermediate read: sorted_M × inter_dim × 2B (~35MB at 8k batch)
+      - Total: ~66MB saved per forward pass
+    
+    This matches AITER's fused approach.
+    
+    Args:
+        hidden_states: Input tensor [num_tokens, model_dim] bf16
+        w1_fp8: Gate-Up projection [num_experts, inter_dim*2, model_dim] fp8
+        w2_fp8: Down projection [num_experts, model_dim, inter_dim] fp8
+        w1_scale: W1 scales [num_experts, ceil(N/128), ceil(K/128)] float
+        w2_scale: W2 scales [num_experts, ceil(N/128), ceil(K/128)] float
+        topk_weight: Routing weights [num_tokens, topk]
+        topk_ids: Expert assignments [num_tokens, topk]
+        expert_mask: Optional mask for expert parallelism
+        activation: Activation function (default: SiLU for G1U1)
+        block_size_M: Block size for M dimension (auto-selected if None)
+        num_local_tokens: For dynamic batching
+        moe_sorting_dispatch_policy: Sorting dispatch policy
+        
+    Returns:
+        Output tensor [num_tokens, model_dim] bf16
+    """
+    M, topk = topk_ids.shape
+    num_experts = w1_fp8.size(0)
+    model_dim = hidden_states.size(1)
+    inter_dim = w1_fp8.size(1) // 2  # G1U1
+    
+    # Use smaller block size for fused kernel (M_TILE=32)
+    if block_size_M is None:
+        block_size_M = 32  # Matches fused kernel's M_TILE
+    
+    # Force block_m=32 for fused kernel
+    if block_size_M != 32:
+        block_size_M = 32
+    
+    # Determine global expert count for EP
+    global_E = num_experts
+    if expert_mask is not None:
+        global_E = expert_mask.numel()
+    
+    dtype = hidden_states.dtype
+    assert dtype == dtypes.bf16, f"HipKittens MoE Fully Fused requires BFloat16 input, got {dtype}"
+    assert activation == ActivationType.Silu, "HipKittens MoE Fully Fused only supports SiLU activation"
+    
+    # Perform MoE sorting
+    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = hipkittens_moe_sorting(
+        topk_ids,
+        topk_weight,
+        global_E,
+        model_dim,
+        dtype,
+        block_size_M,
+        expert_mask,
+        num_local_tokens,
+        moe_sorting_dispatch_policy,
+    )
+    
+    # Call HipKittens fully fused kernel
+    output = _hk_fused_moe_fully_fused_fwd_impl(
+        hidden_states,
+        w1_fp8,
+        w2_fp8,
+        w1_scale,
+        w2_scale,
+        topk_weight,
+        topk_ids,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        topk,
+        block_size_M,
+    )
+    
+    return output

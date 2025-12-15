@@ -278,3 +278,28 @@ __device__ __forceinline__ void fp8x8_to_bf16x8_scaled(
     out_lo = float4_to_bf16x4_packed(f0);
     out_hi = float4_to_bf16x4_packed(f1);
 }
+
+// ============================================================================
+// Forward declarations for fused kernel dispatch
+// ============================================================================
+
+// Fused MoE kernel: Stage1 + Stage2 in single kernel, intermediate in LDS
+void dispatch_hk_moe_fused_fp8(
+    const bf16* hidden_states,
+    const fp8_t* w1_fp8,
+    const fp8_t* w2_fp8,
+    const float* w1_scale,
+    const float* w2_scale,
+    float* output_fp32,
+    const int32_t* sorted_ids,
+    const int32_t* sorted_expert_ids,
+    const int32_t* num_valid_ids,
+    const float* sorted_weights,
+    const int sorted_M,
+    const int num_tokens,
+    const int model_dim,
+    const int inter_dim,
+    const int num_experts,
+    const int block_m_sorting,
+    hipStream_t stream
+);
