@@ -585,6 +585,7 @@ namespace stream_cfg {
 using stream_input_tile = st_bf<stream_cfg::M_TILE, stream_cfg::K_STEP>;      // [32, 32]
 using stream_w1_tile = st_bf<stream_cfg::K_INTER, stream_cfg::K_STEP>;        // [32, 32] for W1 slice
 using stream_w2_tile = st_bf<stream_cfg::N_TILE, stream_cfg::K_INTER>;        // [128, 32] for W2 slice
+using stream_inter_tile = st_bf<stream_cfg::M_TILE, stream_cfg::K_INTER>;     // [32, 32] for intermediate
 
 __global__ __launch_bounds__(stream_cfg::NUM_THREADS, 2)
 void hk_moe_streaming_fp8_kernel(
@@ -619,10 +620,13 @@ void hk_moe_streaming_fp8_kernel(
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al((int*)&__shm[0]);
     
-    // LDS tiles - no intermediate buffer needed!
-    stream_input_tile (&As) = al.allocate<stream_input_tile>();    // [32, 32] for hidden
-    stream_w1_tile (&W1s) = al.allocate<stream_w1_tile>();         // [32, 32] for W1 slice
-    stream_w2_tile (&W2s) = al.allocate<stream_w2_tile>();         // [128, 32] for W2 slice
+    // LDS tiles
+    stream_input_tile (&As) = al.allocate<stream_input_tile>();      // [32, 32] for hidden
+    stream_w1_tile (&W1s) = al.allocate<stream_w1_tile>();           // [32, 32] for W1 slice
+    // Raw 2D array for intermediate (compatible with simple indexing)
+    bf16 (*inter_lds)[K_INTER] = reinterpret_cast<bf16(*)[K_INTER]>(al.ptr);
+    al.ptr += M_TILE * K_INTER * sizeof(bf16);                       // [32, 32] for intermediate
+    stream_w2_tile (&W2s) = al.allocate<stream_w2_tile>();           // [128, 32] for W2 slice
     int* token_row_offsets = (int*)al.allocate<int[M_TILE]>();
     
     // Workgroup position
@@ -897,54 +901,90 @@ void hk_moe_streaming_fp8_kernel(
         
         __syncthreads();
         
-        // Store intermediate to LDS temporarily for the MFMA
-        // We need C_inter in LDS to use as A operand for Stage 2 MFMA
-        // This is the intermediate [M_TILE, K_INTER] for this chunk
+        // ------------------------------------------------------------------
+        // Store intermediate to LDS for Stage 2 MFMA
+        // ------------------------------------------------------------------
+        // C_gate now contains silu(gate) * up in [16, K_INTER] per warp
+        // Store to raw 2D LDS array using the same pattern as original LDS fusion
+        // Note: warps 0 and 1 compute same values (same warp_row_idx=0)
+        //       warps 2 and 3 compute same values (same warp_row_idx=1)
+        // Only warps with warp_col_idx=0 write to avoid duplicate writes
         
-        // Actually, we need to convert C_gate (float) to bf16 in LDS for MFMA
-        // Use W1s as the temporary buffer (it's [K_INTER, K_STEP] = [32, 32])
-        // Reshape it as [M_TILE, K_INTER] = [32, 32] - same size!
+        const int row_off_s2 = (lane_in_warp / 16) * 4;  // 0, 4, 8, 12
+        const int col_off_s2 = lane_in_warp % 16;        // 0-15
         
-        // Write C_gate to LDS
-        const int row_off_s2 = (lane_in_warp / 16) * 4;
-        const int col_off_s2 = lane_in_warp % 16;
-        
-        #pragma unroll
-        for (int inter_sub = 0; inter_sub < INTER_SUBTILES; inter_sub++) {
-            const auto& inter_tile = C_gate[inter_sub].tiles[0][0];
-            int lds_col = inter_sub * DOT_SLICE + col_off_s2;
-            
+        if (warp_col_idx == 0) {  // Only warps 0,2 write (warps 1,3 have same data)
             #pragma unroll
-            for (int r = 0; r < 4; r++) {
-                int lds_row = warp_row_base + row_off_s2 + r;
-                if (lds_row < M_TILE && lds_col < K_INTER) {
-                    float val;
-                    if (r == 0) val = inter_tile.data[0].x;
-                    else if (r == 1) val = inter_tile.data[0].y;
-                    else if (r == 2) val = inter_tile.data[1].x;
-                    else val = inter_tile.data[1].y;
-                    
-                    // Store as bf16 to W1s (reusing the buffer)
-                    W1s.data[lds_row * K_INTER + lds_col] = __float2bfloat16(val);
+            for (int inter_sub = 0; inter_sub < INTER_SUBTILES; inter_sub++) {
+                const auto& inter_tile = C_gate[inter_sub].tiles[0][0];
+                int lds_col = inter_sub * DOT_SLICE + col_off_s2;  // Column in [0, K_INTER)
+                
+                #pragma unroll
+                for (int r = 0; r < 4; r++) {
+                    int lds_row = warp_row_base + row_off_s2 + r;  // Row in [0, M_TILE)
+                    if (lds_row < M_TILE && lds_col < K_INTER) {
+                        float val;
+                        if (r == 0) val = inter_tile.data[0].x;
+                        else if (r == 1) val = inter_tile.data[0].y;
+                        else if (r == 2) val = inter_tile.data[1].x;
+                        else val = inter_tile.data[1].y;
+                        
+                        inter_lds[lds_row][lds_col] = __float2bfloat16(val);
+                    }
                 }
             }
         }
         
         __syncthreads();
         
-        // MFMA for Stage 2: C_out += C_inter × W2^T
-        // C_inter is now in W1s as [M_TILE, K_INTER]
-        // W2 is in W2s as [N_TILE, K_INTER]
+        // ------------------------------------------------------------------
+        // STAGE 2 MFMA: C_out += C_inter × W2^T
+        // ------------------------------------------------------------------
+        // C_inter is now in inter_lds as [M_TILE, K_INTER] = [32, 32]
+        // W2 is in W2s as [N_TILE, K_INTER] = [128, 32]
         
+        // Load intermediate from LDS to shared tile As for MFMA
+        uint32_t As_ptr_s2 = reinterpret_cast<uintptr_t>(&As.data[0]);
+        constexpr int VEC_SIZE_S2 = 8;
+        constexpr int VECS_PER_ROW_S2 = K_INTER / VEC_SIZE_S2;  // 4
+        constexpr int TOTAL_VECS_S2 = M_TILE * VECS_PER_ROW_S2;  // 128
+        
+        #pragma unroll
+        for (int v = 0; v < (TOTAL_VECS_S2 + NUM_THREADS - 1) / NUM_THREADS; v++) {
+            int vec_idx = lane + v * NUM_THREADS;
+            if (vec_idx < TOTAL_VECS_S2) {
+                int m = vec_idx / VECS_PER_ROW_S2;
+                int k = (vec_idx % VECS_PER_ROW_S2) * VEC_SIZE_S2;
+                
+                // Read 8 bf16 values from inter_lds
+                bf16* src = &inter_lds[m][k];
+                
+                // Pack into 2× float2
+                __hip_bfloat162 v01 = *reinterpret_cast<const __hip_bfloat162*>(&src[0]);
+                __hip_bfloat162 v23 = *reinterpret_cast<const __hip_bfloat162*>(&src[2]);
+                __hip_bfloat162 v45 = *reinterpret_cast<const __hip_bfloat162*>(&src[4]);
+                __hip_bfloat162 v67 = *reinterpret_cast<const __hip_bfloat162*>(&src[6]);
+                
+                float2 packed_lo, packed_hi;
+                memcpy(&packed_lo.x, &v01, sizeof(float));
+                memcpy(&packed_lo.y, &v23, sizeof(float));
+                memcpy(&packed_hi.x, &v45, sizeof(float));
+                memcpy(&packed_hi.y, &v67, sizeof(float));
+                
+                store_shared_vec(As.idx(As_ptr_s2, {m, k}), packed_lo);
+                store_shared_vec(As.idx(As_ptr_s2, {m, k + 4}), packed_hi);
+            }
+        }
+        
+        __syncthreads();
+        
+        // MFMA for Stage 2
         rt_bf<REG_M, DOT_SLICE> a_tile_s2;
         
         #pragma unroll
         for (int kk = 0; kk < K_INTER / DOT_SLICE; kk++) {  // 2 iterations for K_INTER=32
-            // Load A (intermediate) from W1s reinterpreted as [M_TILE, K_INTER]
-            // W1s is st_bf<K_INTER, K_STEP> but we use it as st_bf<M_TILE, K_INTER>
-            // Since both are [32, 32], we can reinterpret
-            auto& As_reinterp = *reinterpret_cast<st_bf<M_TILE, K_INTER>*>(&W1s);
-            load(a_tile_s2, subtile_inplace<REG_M, DOT_SLICE>(As_reinterp, {warp_row_idx, kk}));
+            // Load A (intermediate) from As
+            load(a_tile_s2, subtile_inplace<REG_M, DOT_SLICE>(As, {warp_row_idx, kk}));
             
             #pragma unroll
             for (int out_sub = 0; out_sub < OUT_SUBTILES; out_sub++) {
@@ -1034,9 +1074,9 @@ void dispatch_hk_moe_streaming_fp8(
     dim3 grid(num_n_blocks, num_m_blocks);
     dim3 block(NUM_THREADS);
     
-    // Shared memory: input tile + W1 tile + W2 tile + token offsets
+    // Shared memory: input tile + W1 tile + raw intermediate + W2 tile + token offsets
     size_t shm_size = sizeof(stream_input_tile) + sizeof(stream_w1_tile) 
-                    + sizeof(stream_w2_tile) + M_TILE * sizeof(int);
+                    + M_TILE * K_INTER * sizeof(bf16) + sizeof(stream_w2_tile) + M_TILE * sizeof(int);
     
     hk_moe_streaming_fp8_kernel<<<grid, block, shm_size, stream>>>(
         hidden_states, w1_fp8, w2_fp8, w1_scale, w2_scale,
