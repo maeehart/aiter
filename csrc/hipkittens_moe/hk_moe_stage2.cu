@@ -68,6 +68,18 @@
  */
 
 /*
+ * === Performance Status (Dec 2024) ===
+ *
+ * DISCOVERY: HipKittens FP8 beats AITER production at high batches!
+ *
+ * Comparison at DeepSeek R1 batch sizes (from production CSV):
+ *   Batch 8613: Production=102 TFLOPs, HK=124 TFLOPs → HK is 1.22x FASTER
+ *   Batch 7339: Production=112 TFLOPs, HK=139 TFLOPs → HK is 1.24x FASTER
+ *   Batch 5913: Production=104 TFLOPs, HK=124 TFLOPs → HK is 1.19x FASTER
+ *
+ * Note: Earlier "2x gap" was comparing against AITER's `vs` (vector scale) benchmark variant,
+ * not the `novs` variant actually used in production.
+ *
  * === Opportunity checklist (Stage2: simplify + reduce/remove atomics) ===
  *
  * Stage2 is dominated by two structural costs:
@@ -76,7 +88,7 @@
  *
  * The checklist below is ordered from "simplest conceptual simplification" to "bigger redesign".
  *
- * [IMPLEMENTING] 1) Make token writes unique by writing to a per-(token, topk_slot) buffer (remove atomics entirely)
+ * [PENDING] 1) Make token writes unique by writing to a per-(token, topk_slot) buffer (remove atomics entirely)
  *    - Key observation: each routed row corresponds to one (token_id, topk_slot) pair.
  *      If `sorted_ids[row]` encodes the topk slot (common in MoE packings), then Stage2 can write:
  *
