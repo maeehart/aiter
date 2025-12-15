@@ -71,8 +71,8 @@ __device__ __forceinline__ float4 fp8x4_to_float4_scaled(uint32_t packed, float 
 
 // Convert float4 to bf16x4 packed as float2 (for store_shared_vec compatibility)
 __device__ __forceinline__ float2 float4_to_bf16x4_packed(float4 f) {
-    __nv_bfloat162 lo = __float22bfloat162_rn(make_float2(f.x, f.y));
-    __nv_bfloat162 hi = __float22bfloat162_rn(make_float2(f.z, f.w));
+    __hip_bfloat162 lo = __float22bfloat162_rn(make_float2(f.x, f.y));
+    __hip_bfloat162 hi = __float22bfloat162_rn(make_float2(f.z, f.w));
     float2 result;
     memcpy(&result.x, &lo, sizeof(float));
     memcpy(&result.y, &hi, sizeof(float));
@@ -231,6 +231,9 @@ void dispatch_hk_moe_stage2(const moe_stage2_globals& g, float* output_fp32);
 // Forward declarations - FP8 weights with blockscale dequantization
 void dispatch_hk_moe_stage1_fp8(const moe_stage1_fp8_globals& g);
 void dispatch_hk_moe_stage2_fp8(const moe_stage2_fp8_globals& g, float* output_fp32);
+
+// FP8 with fused activation (writes only inter_dim cols instead of 2*inter_dim)
+void dispatch_hk_moe_stage1_fp8_fused_act(const moe_stage1_fp8_globals& g);
 
 // SiLU activation
 __device__ __forceinline__ float silu_activation(float x) {

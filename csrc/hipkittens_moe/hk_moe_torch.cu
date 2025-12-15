@@ -426,6 +426,129 @@ torch::Tensor hk_fused_moe_fp8_fwd(
 }
 
 /**
+ * HipKittens Fused MoE Forward Pass with FP8 Weights + Fused Activation
+ * 
+ * This version fuses the G1U1 activation (silu(gate) * up) into Stage1.
+ * Benefits:
+ *   - One less kernel launch
+ *   - 50% reduction in intermediate memory traffic
+ * 
+ * The intermediate buffer is now [sorted_M, inter_dim] instead of [sorted_M, 2*inter_dim].
+ */
+torch::Tensor hk_fused_moe_fp8_fused_act_fwd(
+    torch::Tensor hidden_states,     // [num_tokens, model_dim] bf16
+    torch::Tensor w1_fp8,            // [num_experts, inter_dim*2, model_dim] fp8
+    torch::Tensor w2_fp8,            // [num_experts, model_dim, inter_dim] fp8
+    torch::Tensor w1_scale,          // [num_experts, num_scale_n1, num_scale_k1] float
+    torch::Tensor w2_scale,          // [num_experts, num_scale_n2, num_scale_k2] float
+    torch::Tensor topk_weight,       // [num_tokens, topk]
+    torch::Tensor topk_ids,          // [num_tokens, topk]
+    torch::Tensor sorted_ids,        // [sorted_M]
+    torch::Tensor sorted_weights,    // [sorted_M]
+    torch::Tensor sorted_expert_ids, // [num_tiles]
+    torch::Tensor num_valid_ids,     // [num_experts]
+    int topk,
+    int block_m
+) {
+    const int num_tokens = hidden_states.size(0);
+    const int model_dim = hidden_states.size(1);
+    const int num_experts = w1_fp8.size(0);
+    const int inter_dim = w1_fp8.size(1) / 2;  // G1U1
+    const int sorted_M = sorted_ids.size(0);
+    
+    // Scale dimensions
+    const int num_scale_n1 = w1_scale.size(1);
+    const int num_scale_k1 = w1_scale.size(2);
+    const int num_scale_n2 = w2_scale.size(1);
+    const int num_scale_k2 = w2_scale.size(2);
+    
+    auto options = torch::TensorOptions()
+        .dtype(torch::kBFloat16)
+        .device(hidden_states.device());
+    
+    // Allocate intermediate buffer - HALF the size since activation is fused!
+    torch::Tensor intermediate = torch::zeros({sorted_M, inter_dim}, options);
+    
+    // Allocate output
+    torch::Tensor output = torch::zeros({num_tokens, model_dim}, options);
+    
+    hipStream_t stream = at::hip::getCurrentHIPStream();
+    
+    // Stage 1: Gate-Up projection with FP8 weights AND fused activation
+    {
+        moe_stage1_fp8_globals g1 = {
+            .hidden_states = make_gl_4d(
+                reinterpret_cast<bf16*>(hidden_states.data_ptr()),
+                (size_t)1, (size_t)1, (size_t)num_tokens, (size_t)model_dim
+            ),
+            .w1_fp8 = get_fp8_ptr(w1_fp8),
+            .w1_scale = w1_scale.data_ptr<float>(),
+            .intermediate = make_gl_4d(
+                reinterpret_cast<bf16*>(intermediate.data_ptr()),
+                (size_t)1, (size_t)1, (size_t)sorted_M, (size_t)inter_dim  // Only inter_dim cols!
+            ),
+            .sorted_ids = sorted_ids.data_ptr<int32_t>(),
+            .sorted_expert_ids = sorted_expert_ids.data_ptr<int32_t>(),
+            .num_valid_ids = num_valid_ids.data_ptr<int32_t>(),
+            .sorted_M = sorted_M,
+            .num_tokens = num_tokens,
+            .model_dim = model_dim,
+            .inter_dim = inter_dim,
+            .num_experts = num_experts,
+            .topk = topk,
+            .block_m = block_m,
+            .num_scale_n = num_scale_n1,
+            .num_scale_k = num_scale_k1,
+            .stream = stream
+        };
+        
+        // Use the fused activation kernel - no separate activation pass!
+        dispatch_hk_moe_stage1_fp8_fused_act(g1);
+    }
+    
+    // Stage 2: Down projection with FP8 weights
+    {
+        torch::Tensor output_fp32 = torch::zeros({num_tokens, model_dim}, 
+            torch::TensorOptions().dtype(torch::kFloat32).device(hidden_states.device()));
+        
+        moe_stage2_fp8_globals g2 = {
+            .intermediate = make_gl_4d(
+                reinterpret_cast<bf16*>(intermediate.data_ptr()),
+                (size_t)1, (size_t)1, (size_t)sorted_M, (size_t)inter_dim  // Only inter_dim cols!
+            ),
+            .w2_fp8 = get_fp8_ptr(w2_fp8),
+            .w2_scale = w2_scale.data_ptr<float>(),
+            .output = make_gl_4d(
+                reinterpret_cast<bf16*>(output.data_ptr()),
+                (size_t)1, (size_t)1, (size_t)num_tokens, (size_t)model_dim
+            ),
+            .sorted_ids = sorted_ids.data_ptr<int32_t>(),
+            .sorted_expert_ids = sorted_expert_ids.data_ptr<int32_t>(),
+            .num_valid_ids = num_valid_ids.data_ptr<int32_t>(),
+            .sorted_weights = sorted_weights.data_ptr<float>(),
+            .sorted_M = sorted_M,
+            .num_tokens = num_tokens,
+            .model_dim = model_dim,
+            .inter_dim = inter_dim,
+            .inter_row_stride = inter_dim,  // No longer 2*inter_dim!
+            .num_experts = num_experts,
+            .topk = topk,
+            .block_m = block_m,
+            .num_scale_n = num_scale_n2,
+            .num_scale_k = num_scale_k2,
+            .stream = stream
+        };
+        
+        dispatch_hk_moe_stage2_fp8(g2, output_fp32.data_ptr<float>());
+        
+        // Convert fp32 back to bf16
+        output = output_fp32.to(torch::kBFloat16);
+    }
+    
+    return output;
+}
+
+/**
  * Stage 1 FP8 Forward (for testing)
  */
 torch::Tensor hk_moe_stage1_fp8_fwd(

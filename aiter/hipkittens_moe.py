@@ -465,3 +465,131 @@ def hipkittens_moe_stage1_fp8(
         Stage 1 output [num_tokens, topk, inter_dim*2]
     """
     pass
+
+
+# ============================================================================
+# FP8 with Fused Activation (Optimized)
+# ============================================================================
+
+@compile_ops(_HK_MOE_MODULE, fc_name="hk_fused_moe_fp8_fused_act_fwd")
+def _hk_fused_moe_fp8_fused_act_fwd_impl(
+    hidden_states: torch.Tensor,
+    w1_fp8: torch.Tensor,
+    w2_fp8: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    sorted_weights: torch.Tensor,
+    sorted_expert_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    topk: int,
+    block_m: int,
+) -> torch.Tensor:
+    """Internal implementation that triggers JIT compilation."""
+    pass
+
+
+def hipkittens_fused_moe_fp8_fused_act(
+    hidden_states: torch.Tensor,
+    w1_fp8: torch.Tensor,
+    w2_fp8: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_mask: Optional[torch.Tensor] = None,
+    activation: ActivationType = ActivationType.Silu,
+    block_size_M: Optional[int] = None,
+    num_local_tokens: Optional[torch.Tensor] = None,
+    moe_sorting_dispatch_policy: int = 0,
+) -> torch.Tensor:
+    """
+    HipKittens-based fused MoE forward pass with FP8 weights and FUSED activation.
+    
+    This version fuses the G1U1 activation (silu(gate) * up) into Stage 1,
+    eliminating the separate activation kernel and reducing intermediate
+    memory traffic by 50%.
+    
+    Benefits over hipkittens_fused_moe_fp8:
+      - One less kernel launch
+      - 50% reduction in intermediate memory traffic
+      - Better for memory-bound workloads
+    
+    Trade-off:
+      - 2x the weight loads in Stage 1 (loads both gate and up weights)
+      - May be slower for very small batches where compute dominates
+    
+    Args:
+        hidden_states: Input tensor [num_tokens, model_dim] bf16
+        w1_fp8: Gate-Up projection [num_experts, inter_dim*2, model_dim] fp8
+        w2_fp8: Down projection [num_experts, model_dim, inter_dim] fp8
+        w1_scale: W1 scales [num_experts, ceil(N/128), ceil(K/128)] float
+        w2_scale: W2 scales [num_experts, ceil(N/128), ceil(K/128)] float
+        topk_weight: Routing weights [num_tokens, topk]
+        topk_ids: Expert assignments [num_tokens, topk]
+        expert_mask: Optional mask for expert parallelism
+        activation: Activation function (default: SiLU for G1U1)
+        block_size_M: Block size for M dimension (auto-selected if None)
+        num_local_tokens: For dynamic batching
+        moe_sorting_dispatch_policy: Sorting dispatch policy
+        
+    Returns:
+        Output tensor [num_tokens, model_dim] bf16
+    """
+    M, topk = topk_ids.shape
+    num_experts = w1_fp8.size(0)
+    model_dim = hidden_states.size(1)
+    inter_dim = w1_fp8.size(1) // 2  # G1U1
+    
+    # Auto-select block size based on batch size
+    if block_size_M is None:
+        block_size_M = get_hipkittens_block_m(M)
+    
+    # Force block_m=128 for correctness
+    if block_size_M != 128:
+        block_size_M = 128
+    
+    # Determine global expert count for EP
+    global_E = num_experts
+    if expert_mask is not None:
+        global_E = expert_mask.numel()
+    
+    dtype = hidden_states.dtype
+    assert dtype == dtypes.bf16, f"HipKittens MoE FP8 requires BFloat16 input, got {dtype}"
+    
+    # Verify G1U1 configuration
+    assert activation == ActivationType.Silu, "HipKittens MoE FP8 only supports SiLU activation"
+    
+    # Perform MoE sorting
+    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = hipkittens_moe_sorting(
+        topk_ids,
+        topk_weight,
+        global_E,
+        model_dim,
+        dtype,
+        block_size_M,
+        expert_mask,
+        num_local_tokens,
+        moe_sorting_dispatch_policy,
+    )
+    
+    # Call HipKittens fused MoE FP8 with fused activation
+    output = _hk_fused_moe_fp8_fused_act_fwd_impl(
+        hidden_states,
+        w1_fp8,
+        w2_fp8,
+        w1_scale,
+        w2_scale,
+        topk_weight,
+        topk_ids,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        topk,
+        block_size_M,
+    )
+    
+    return output

@@ -921,3 +921,323 @@ void dispatch_hk_moe_stage1_fp8(const moe_stage1_fp8_globals& g) {
         g.num_scale_k
     );
 }
+
+// ============================================================================
+// FP8 Blockscale with Fused Activation - Stage 1
+// ============================================================================
+//
+// This kernel fuses the G1U1 activation (silu(gate) * up) directly into Stage1.
+// Benefits:
+//   - Eliminates the separate activation kernel launch
+//   - Reduces intermediate memory traffic by 50% (writes inter_dim instead of 2*inter_dim)
+//   - Better for memory-bound workloads
+//
+// Trade-off:
+//   - 2x the weight loads (both gate and up weights for each output column)
+//   - 2x the compute (but still compute-bound at high batch sizes)
+//
+// For each output column n ∈ [0, inter_dim):
+//   gate[n] = Σ_k input[k] * w1[expert, n, k]             (row n of w1)
+//   up[n]   = Σ_k input[k] * w1[expert, inter_dim+n, k]   (row inter_dim+n of w1)
+//   output[n] = silu(gate[n]) * up[n]
+
+__global__ __launch_bounds__(s1_cfg::NUM_THREADS, 2)
+void hk_moe_stage1_fp8_fused_act_kernel(
+    const bf16* __restrict__ hidden_states,
+    const fp8_t* __restrict__ w1_fp8,
+    const float* __restrict__ w1_scale,
+    bf16* __restrict__ intermediate,         // [sorted_M, inter_dim] - only activated output
+    const int32_t* __restrict__ sorted_ids,
+    const int32_t* __restrict__ sorted_expert_ids,
+    const int32_t* __restrict__ num_valid_ids,
+    const int sorted_M,
+    const int num_tokens,
+    const int model_dim,
+    const int inter_dim,
+    const int num_experts,
+    const int block_m_sorting,
+    const int num_m_blocks,
+    const int num_n_blocks,
+    const int num_scale_n,
+    const int num_scale_k
+) {
+    using namespace s1_cfg;
+    using namespace fp8_cfg;
+    
+    const int sorted_M_valid = num_valid_ids[0];
+    const int total_n_w1 = inter_dim * 2;  // Full w1 width (gate + up)
+    
+    extern __shared__ alignment_dummy __shm[];
+    shared_allocator al((int*)&__shm[0]);
+    
+    // Allocate shared memory: input tile + gate weights + up weights
+    s1_st_tile (&As) = al.allocate<s1_st_tile>();
+    s1_st_tile (&Bs_gate) = al.allocate<s1_st_tile>();  // Gate weights
+    s1_st_tile (&Bs_up) = al.allocate<s1_st_tile>();    // Up weights
+    int (&token_row_offsets)[BLOCK_SIZE] = al.allocate<int, BLOCK_SIZE>();
+    
+    const uint32_t As_ptr = reinterpret_cast<uintptr_t>(&As.data[0]);
+    const uint32_t Bs_gate_ptr = reinterpret_cast<uintptr_t>(&Bs_gate.data[0]);
+    const uint32_t Bs_up_ptr = reinterpret_cast<uintptr_t>(&Bs_up.data[0]);
+    
+    // Register accumulators for gate and up
+    rt_bf<REG_BLOCK, DOT_SLICE> a_tile, b_tile_gate, b_tile_up;
+    rt_fl<REG_BLOCK, REG_BLOCK, ducks::rt_layout::col> C_gate[2], C_up[2];
+    zero(C_gate[0]); zero(C_gate[1]);
+    zero(C_up[0]); zero(C_up[1]);
+    
+    // XCD-aware block scheduling
+    int wgid = (blockIdx.y * gridDim.x) + blockIdx.x;
+    const int NUM_WGS = gridDim.x * gridDim.y;
+    wgid = chiplet_transform_chunked(wgid, NUM_WGS, NUM_XCDS, WGM * WGM);
+    
+    if (wgid >= NUM_WGS) return;
+    
+    int pid_m = wgid / num_n_blocks;
+    int pid_n = wgid % num_n_blocks;
+    
+    if (pid_m >= num_m_blocks || pid_n >= num_n_blocks) return;
+    
+    const int row_start = pid_m * BLOCK_SIZE;
+    const int col_start = pid_n * BLOCK_SIZE;  // Output column (0 to inter_dim)
+    
+    if (row_start >= sorted_M_valid || col_start >= inter_dim) return;
+    
+    const int tile_id = row_start / block_m_sorting;
+    const int expert_id = sorted_expert_ids[tile_id];
+    
+    if (expert_id < 0 || expert_id >= num_experts) return;
+    
+    // Expert's FP8 weight bases
+    const fp8_t* w1_expert_fp8 = w1_fp8 + expert_id * (size_t)total_n_w1 * model_dim;
+    const float* w1_expert_scale = w1_scale + expert_id * (size_t)num_scale_n * num_scale_k;
+    
+    const int warp_id = warpid();
+    const int warp_row = warp_id / 4;
+    const int warp_col = warp_id % 4;
+    
+    const int num_k_tiles = (model_dim + K_STEP - 1) / K_STEP;
+    const int lane = threadIdx.x;
+    constexpr int VEC_SIZE = 8;
+
+    // Precompute token row offsets
+    if (lane < BLOCK_SIZE) {
+        const int row = row_start + lane;
+        int base = -1;
+        if (row < sorted_M_valid) {
+            const int packed_id = sorted_ids[row];
+            const int token_id = packed_id & 0xFFFFFF;
+            if (token_id >= 0 && token_id < num_tokens) base = token_id * model_dim;
+        }
+        token_row_offsets[lane] = base;
+    }
+    __syncthreads();
+
+    // Main K-loop
+    for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) {
+        const int k_start = k_tile * K_STEP;
+        
+        // Load input tile (same for both gate and up)
+        constexpr int VECS_PER_ROW = K_STEP / VEC_SIZE;
+        constexpr int TOTAL_VECS = BLOCK_SIZE * VECS_PER_ROW;
+        constexpr int VECS_PER_THREAD = TOTAL_VECS / NUM_THREADS;
+        
+        #pragma unroll
+        for (int v = 0; v < VECS_PER_THREAD; v++) {
+            int vec_idx = lane * VECS_PER_THREAD + v;
+            int m = vec_idx / VECS_PER_ROW;
+            int k = (vec_idx % VECS_PER_ROW) * VEC_SIZE;
+
+            float4 buf = {0.f, 0.f, 0.f, 0.f};
+            const int base = token_row_offsets[m];
+            if (base >= 0 && (k_start + k + VEC_SIZE - 1) < model_dim) {
+                buf = load_global_vec4(reinterpret_cast<const float4*>(
+                    &hidden_states[base + k_start + k]
+                ));
+            }
+            store_shared_vec(As.idx(As_ptr, {m, k}), {buf.x, buf.y});
+            store_shared_vec(As.idx(As_ptr, {m, k + 4}), {buf.z, buf.w});
+        }
+        
+        // Load gate weights (rows col_start to col_start+128)
+        // Load up weights (rows inter_dim+col_start to inter_dim+col_start+128)
+        constexpr int TOTAL_VECS_W = (BLOCK_SIZE * K_STEP) / VEC_SIZE;
+        constexpr int VECS_PER_THREAD_W = TOTAL_VECS_W / NUM_THREADS;
+        
+        #pragma unroll
+        for (int v = 0; v < VECS_PER_THREAD_W; v++) {
+            const int n = (lane >> 2);
+            const int k = (lane & 3) << 3;
+            const int k_global = k_start + k;
+            
+            float2 gate_lo = {0.f, 0.f}, gate_hi = {0.f, 0.f};
+            float2 up_lo = {0.f, 0.f}, up_hi = {0.f, 0.f};
+            
+            int col_gate = col_start + n;           // Gate row in w1
+            int col_up = inter_dim + col_start + n; // Up row in w1
+            
+            if (col_gate < inter_dim && (k_global + VEC_SIZE - 1) < model_dim) {
+                // Gate weights
+                int n_block_gate = col_gate / SCALE_BLOCK_N;
+                int k_block = k_global / SCALE_BLOCK_K;
+                float scale_gate = w1_expert_scale[n_block_gate * num_scale_k + k_block];
+                const fp8_t* src_gate = &w1_expert_fp8[col_gate * model_dim + k_global];
+                fp8x8_to_bf16x8_scaled(src_gate, scale_gate, gate_lo, gate_hi);
+                
+                // Up weights
+                int n_block_up = col_up / SCALE_BLOCK_N;
+                float scale_up = w1_expert_scale[n_block_up * num_scale_k + k_block];
+                const fp8_t* src_up = &w1_expert_fp8[col_up * model_dim + k_global];
+                fp8x8_to_bf16x8_scaled(src_up, scale_up, up_lo, up_hi);
+            }
+            
+            store_shared_vec(Bs_gate.idx(Bs_gate_ptr, {n, k}), {gate_lo.x, gate_lo.y});
+            store_shared_vec(Bs_gate.idx(Bs_gate_ptr, {n, k + 4}), {gate_hi.x, gate_hi.y});
+            store_shared_vec(Bs_up.idx(Bs_up_ptr, {n, k}), {up_lo.x, up_lo.y});
+            store_shared_vec(Bs_up.idx(Bs_up_ptr, {n, k + 4}), {up_hi.x, up_hi.y});
+        }
+
+        __syncthreads();
+        
+        // MFMA for both gate and up
+        #pragma unroll
+        for (int kk = 0; kk < K_STEP / DOT_SLICE; kk++) {
+            // Load input subtile
+            load(a_tile, subtile_inplace<REG_BLOCK, DOT_SLICE>(As, {warp_row, kk}));
+            load(b_tile_gate, subtile_inplace<REG_BLOCK, DOT_SLICE>(Bs_gate, {warp_col, kk}));
+            load(b_tile_up, subtile_inplace<REG_BLOCK, DOT_SLICE>(Bs_up, {warp_col, kk}));
+            
+            __builtin_amdgcn_sched_barrier(0);
+            asm volatile("s_waitcnt lgkmcnt(0)");
+            
+            // Gate MFMA
+            __builtin_amdgcn_s_setprio(1);
+            mma_ABt(C_gate[0], a_tile, b_tile_gate, C_gate[0]);
+            __builtin_amdgcn_s_setprio(0);
+            
+            // Up MFMA
+            __builtin_amdgcn_s_setprio(1);
+            mma_ABt(C_up[0], a_tile, b_tile_up, C_up[0]);
+            __builtin_amdgcn_s_setprio(0);
+            
+            __builtin_amdgcn_sched_barrier(0);
+            
+            // Load second A subtile
+            load(a_tile, subtile_inplace<REG_BLOCK, DOT_SLICE>(As, {warp_row + 2, kk}));
+            
+            __builtin_amdgcn_sched_barrier(0);
+            asm volatile("s_waitcnt lgkmcnt(0)");
+            
+            // Gate MFMA for second half
+            __builtin_amdgcn_s_setprio(1);
+            mma_ABt(C_gate[1], a_tile, b_tile_gate, C_gate[1]);
+            __builtin_amdgcn_s_setprio(0);
+            
+            // Up MFMA for second half
+            __builtin_amdgcn_s_setprio(1);
+            mma_ABt(C_up[1], a_tile, b_tile_up, C_up[1]);
+            __builtin_amdgcn_s_setprio(0);
+            
+            __builtin_amdgcn_sched_barrier(0);
+        }
+        
+        __syncthreads();
+    }
+    
+    // Epilogue: Apply activation silu(gate) * up and store
+    const int out_row_base_0 = row_start + warp_row * 32;
+    const int out_row_base_1 = row_start + (warp_row + 2) * 32;
+    const int out_col_base = col_start + warp_col * 32;
+    const int lane_id = laneid();
+    const int row_off = 4 * (lane_id / 16);
+    const int col_off = lane_id % 16;
+    
+    // Store first 32x32 tile with fused activation
+    #pragma unroll
+    for (int tile_row = 0; tile_row < 2; tile_row++) {
+        #pragma unroll
+        for (int tile_col = 0; tile_col < 2; tile_col++) {
+            const auto& gate_tile = C_gate[0].tiles[tile_row][tile_col];
+            const auto& up_tile = C_up[0].tiles[tile_row][tile_col];
+            int base_row = out_row_base_0 + tile_row * 16 + row_off;
+            int col = out_col_base + tile_col * 16 + col_off;
+            
+            if (col < inter_dim) {
+                #pragma unroll
+                for (int r = 0; r < 4; r++) {
+                    if (base_row + r < sorted_M_valid) {
+                        float gate_val = (r < 2) ? ((r == 0) ? gate_tile.data[0].x : gate_tile.data[0].y)
+                                                 : ((r == 2) ? gate_tile.data[1].x : gate_tile.data[1].y);
+                        float up_val = (r < 2) ? ((r == 0) ? up_tile.data[0].x : up_tile.data[0].y)
+                                               : ((r == 2) ? up_tile.data[1].x : up_tile.data[1].y);
+                        float activated = silu_activation(gate_val) * up_val;
+                        intermediate[(base_row + r) * inter_dim + col] = __float2bfloat16(activated);
+                    }
+                }
+            }
+        }
+    }
+    
+    // Store second 32x32 tile with fused activation
+    #pragma unroll
+    for (int tile_row = 0; tile_row < 2; tile_row++) {
+        #pragma unroll
+        for (int tile_col = 0; tile_col < 2; tile_col++) {
+            const auto& gate_tile = C_gate[1].tiles[tile_row][tile_col];
+            const auto& up_tile = C_up[1].tiles[tile_row][tile_col];
+            int base_row = out_row_base_1 + tile_row * 16 + row_off;
+            int col = out_col_base + tile_col * 16 + col_off;
+            
+            if (col < inter_dim) {
+                #pragma unroll
+                for (int r = 0; r < 4; r++) {
+                    if (base_row + r < sorted_M_valid) {
+                        float gate_val = (r < 2) ? ((r == 0) ? gate_tile.data[0].x : gate_tile.data[0].y)
+                                                 : ((r == 2) ? gate_tile.data[1].x : gate_tile.data[1].y);
+                        float up_val = (r < 2) ? ((r == 0) ? up_tile.data[0].x : up_tile.data[0].y)
+                                               : ((r == 2) ? up_tile.data[1].x : up_tile.data[1].y);
+                        float activated = silu_activation(gate_val) * up_val;
+                        intermediate[(base_row + r) * inter_dim + col] = __float2bfloat16(activated);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Dispatch function for FP8 with fused activation
+void dispatch_hk_moe_stage1_fp8_fused_act(const moe_stage1_fp8_globals& g) {
+    using namespace s1_cfg;
+    
+    // Only tile over inter_dim (not 2*inter_dim) since we output activated values
+    const int num_m_blocks = (g.sorted_M + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const int num_n_blocks = (g.inter_dim + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    
+    dim3 grid(num_n_blocks, num_m_blocks);
+    dim3 block(NUM_THREADS);
+    
+    // Need 3 tiles: As, Bs_gate, Bs_up + token offsets
+    size_t smem_size = sizeof(s1_st_tile) * 3 + sizeof(int) * BLOCK_SIZE + 256;
+    hipFuncSetAttribute((void*)hk_moe_stage1_fp8_fused_act_kernel, 
+                        hipFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    
+    hk_moe_stage1_fp8_fused_act_kernel<<<grid, block, smem_size, g.stream>>>(
+        g.hidden_states.raw_ptr,
+        g.w1_fp8,
+        g.w1_scale,
+        g.intermediate.raw_ptr,
+        g.sorted_ids,
+        g.sorted_expert_ids,
+        g.num_valid_ids,
+        g.sorted_M,
+        g.num_tokens,
+        g.model_dim,
+        g.inter_dim,
+        g.num_experts,
+        g.block_m,
+        num_m_blocks,
+        num_n_blocks,
+        g.num_scale_n,
+        g.num_scale_k
+    );
+}
