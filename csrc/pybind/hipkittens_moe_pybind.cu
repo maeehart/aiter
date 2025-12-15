@@ -89,6 +89,23 @@ torch::Tensor hk_fused_moe_fp8_fused_act_fwd(
     int block_m
 );
 
+// FP8 with fused activation + atomic-free Stage 2
+torch::Tensor hk_fused_moe_fp8_noatomic_fwd(
+    torch::Tensor hidden_states,
+    torch::Tensor w1_fp8,
+    torch::Tensor w2_fp8,
+    torch::Tensor w1_scale,
+    torch::Tensor w2_scale,
+    torch::Tensor topk_weight,
+    torch::Tensor topk_ids,
+    torch::Tensor sorted_ids,
+    torch::Tensor sorted_weights,
+    torch::Tensor sorted_expert_ids,
+    torch::Tensor num_valid_ids,
+    int topk,
+    int block_m
+);
+
 namespace py = pybind11;
 
 PYBIND11_MODULE(module_hipkittens_moe, m) {
@@ -215,6 +232,53 @@ PYBIND11_MODULE(module_hipkittens_moe, m) {
           "memory traffic by 50% (writes inter_dim cols instead of 2*inter_dim).\n"
           "\n"
           "Recommended for memory-bound workloads.\n"
+          "\n"
+          "Args:\n"
+          "    hidden_states: Input tensor [num_tokens, model_dim] bf16\n"
+          "    w1_fp8: Gate-Up weights [num_experts, inter_dim*2, model_dim] fp8\n"
+          "    w2_fp8: Down weights [num_experts, model_dim, inter_dim] fp8\n"
+          "    w1_scale: W1 scales [num_experts, ceil(N/128), ceil(K/128)] float\n"
+          "    w2_scale: W2 scales [num_experts, ceil(N/128), ceil(K/128)] float\n"
+          "    topk_weight: Routing weights [num_tokens, topk]\n"
+          "    topk_ids: Expert assignments [num_tokens, topk]\n"
+          "    sorted_ids: Sorted token IDs [padded_M]\n"
+          "    sorted_weights: Sorted routing weights [padded_M]\n"
+          "    sorted_expert_ids: Expert ID per tile [num_tiles]\n"
+          "    num_valid_ids: Valid tokens per expert [num_experts]\n"
+          "    topk: Number of experts per token\n"
+          "    block_m: Block size for M dimension\n"
+          "\n"
+          "Returns:\n"
+          "    Output tensor [num_tokens, model_dim]",
+          py::arg("hidden_states"),
+          py::arg("w1_fp8"),
+          py::arg("w2_fp8"),
+          py::arg("w1_scale"),
+          py::arg("w2_scale"),
+          py::arg("topk_weight"),
+          py::arg("topk_ids"),
+          py::arg("sorted_ids"),
+          py::arg("sorted_weights"),
+          py::arg("sorted_expert_ids"),
+          py::arg("num_valid_ids"),
+          py::arg("topk"),
+          py::arg("block_m"));
+    
+    // EXPERIMENTAL: FP8 with fused activation + atomic-free Stage 2
+    m.def("hk_fused_moe_fp8_noatomic_fwd", &hk_fused_moe_fp8_noatomic_fwd,
+          "HipKittens Fused MoE Forward Pass with FP8 Weights + Fused Activation + No Atomics\n"
+          "\n"
+          "EXPERIMENTAL: Uses atomic-free Stage 2 by writing to per-(token, slot) buffer.\n"
+          "\n"
+          "Benefits:\n"
+          "  - No atomic contention in Stage 2\n"
+          "  - Better parallelism for high-collision scenarios\n"
+          "\n"
+          "Trade-offs:\n"
+          "  - Extra memory: num_tokens * topk * model_dim * 4 bytes\n"
+          "  - Extra reduction kernel launch\n"
+          "\n"
+          "For DeepSeek R1 (8k tokens, topk=8, model_dim=7168): ~1.87 GB temp buffer\n"
           "\n"
           "Args:\n"
           "    hidden_states: Input tensor [num_tokens, model_dim] bf16\n"

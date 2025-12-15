@@ -235,6 +235,14 @@ void dispatch_hk_moe_stage2_fp8(const moe_stage2_fp8_globals& g, float* output_f
 // FP8 with fused activation (writes only inter_dim cols instead of 2*inter_dim)
 void dispatch_hk_moe_stage1_fp8_fused_act(const moe_stage1_fp8_globals& g);
 
+// EXPERIMENTAL: Atomic-free Stage 2 - writes to per-(token,slot) buffer + reduction
+// tmp_buffer must be pre-allocated as [num_tokens, topk, model_dim] in fp32
+void dispatch_hk_moe_stage2_fp8_noatomic(
+    const moe_stage2_fp8_globals& g,
+    float* tmp_buffer,    // [num_tokens, topk, model_dim]
+    float* output_fp32    // [num_tokens, model_dim]
+);
+
 // SiLU activation
 __device__ __forceinline__ float silu_activation(float x) {
     return x / (1.0f + expf(-x));

@@ -38,7 +38,12 @@ from aiter import pertoken_quant
 from einops import rearrange
 
 try:
-    from aiter.hipkittens_moe import hipkittens_fused_moe, hipkittens_fused_moe_fp8
+    from aiter.hipkittens_moe import (
+        hipkittens_fused_moe,
+        hipkittens_fused_moe_fp8,
+        hipkittens_fused_moe_fp8_fused_act,
+        hipkittens_fused_moe_fp8_noatomic,
+    )
     HIPKITTENS_AVAILABLE = True
     HIPKITTENS_FP8_AVAILABLE = True
 except ImportError as e:
@@ -233,13 +238,32 @@ def bench_hipkittens_fp8(hidden, w1_fp8, w2_fp8, w1_scale, w2_scale, topk_w, top
     return hipkittens_fused_moe_fp8(hidden, w1_fp8, w2_fp8, w1_scale, w2_scale, topk_w, topk_ids)
 
 
-def run_fp8_benchmark(batch_sizes, cfg):
-    """Run FP8 blockscale benchmark."""
+@perftest()
+def bench_hipkittens_fp8_fused_act(hidden, w1_fp8, w2_fp8, w1_scale, w2_scale, topk_w, topk_ids):
+    return hipkittens_fused_moe_fp8_fused_act(hidden, w1_fp8, w2_fp8, w1_scale, w2_scale, topk_w, topk_ids)
+
+
+@perftest()
+def bench_hipkittens_fp8_noatomic(hidden, w1_fp8, w2_fp8, w1_scale, w2_scale, topk_w, topk_ids):
+    return hipkittens_fused_moe_fp8_noatomic(hidden, w1_fp8, w2_fp8, w1_scale, w2_scale, topk_w, topk_ids)
+
+
+def run_fp8_benchmark(batch_sizes, cfg, compare_fused_act=True, compare_noatomic=False):
+    """Run FP8 blockscale benchmark.
+    
+    Args:
+        batch_sizes: List of batch sizes to test
+        cfg: MoE configuration dict
+        compare_fused_act: If True, also benchmark the fused activation variant
+        compare_noatomic: If True, also benchmark the atomic-free variant
+    """
     print(f"\n{'='*70}")
     print(f"HipKittens MoE FP8 Blockscale Benchmark")
     print(f"Config: model_dim={cfg['model_dim']}, inter_dim={cfg['inter_dim']}")
     print(f"        experts={cfg['num_experts']}, topk={cfg['topk']}")
     print(f"        FP8 blockscale: {FP8_SCALE_BLOCK_N}x{FP8_SCALE_BLOCK_K}")
+    if compare_fused_act:
+        print(f"        Comparing: FP8 vs FP8+FusedAct")
     print(f"{'='*70}\n")
     
     results = []
@@ -261,33 +285,134 @@ def run_fp8_benchmark(batch_sizes, cfg):
             print(f"  PyTorch reference failed: {e}")
             ref_out = None
         
-        # HipKittens FP8
+        hk_fp8_us, hk_fp8_tf = float('inf'), 0
+        hk_fused_us, hk_fused_tf = float('inf'), 0
+        
+        # HipKittens FP8 (non-fused)
         if HIPKITTENS_FP8_AVAILABLE:
             try:
                 hk_fp8_out, hk_fp8_us = bench_hipkittens_fp8(hidden, w1_fp8, w2_fp8, w1_scale, w2_scale, topk_w, topk_ids)
                 hk_fp8_tf = flops / (hk_fp8_us * 1e-6) / 1e12
-                print(f"  HK FP8:     {hk_fp8_us:8.2f} us, {hk_fp8_tf:6.2f} TFLOPs")
+                print(f"  HK FP8:         {hk_fp8_us:8.2f} us, {hk_fp8_tf:6.2f} TFLOPs")
                 
                 if ref_out is not None:
                     mismatch = checkAllclose(
                         ref_out, hk_fp8_out, rtol=0.05, atol=0.1, msg=f"batch={bs}", printLog=False
                     )
                     verdict = "PASS" if mismatch == 0 else f"WARN (mismatch={mismatch:.1%})"
-                    print(f"  Correctness vs PyTorch: {verdict}")
+                    print(f"    Correctness: {verdict}")
             except Exception as e:
-                print(f"  HK FP8:     Failed - {e}")
-                hk_fp8_us, hk_fp8_tf = float('inf'), 0
-        else:
-            print(f"  HK FP8:     Not available")
-            hk_fp8_us, hk_fp8_tf = float('inf'), 0
+                print(f"  HK FP8:         Failed - {e}")
         
-        results.append({"batch": bs, "hk_fp8_us": hk_fp8_us, "hk_fp8_tf": hk_fp8_tf})
+        # HipKittens FP8 + Fused Activation
+        if compare_fused_act and HIPKITTENS_FP8_AVAILABLE:
+            try:
+                hk_fused_out, hk_fused_us = bench_hipkittens_fp8_fused_act(hidden, w1_fp8, w2_fp8, w1_scale, w2_scale, topk_w, topk_ids)
+                hk_fused_tf = flops / (hk_fused_us * 1e-6) / 1e12
+                speedup = hk_fp8_us / hk_fused_us if hk_fused_us > 0 else 0
+                print(f"  HK FP8+Fused:   {hk_fused_us:8.2f} us, {hk_fused_tf:6.2f} TFLOPs ({speedup:.2f}x vs non-fused)")
+                
+                if ref_out is not None:
+                    mismatch = checkAllclose(
+                        ref_out, hk_fused_out, rtol=0.05, atol=0.1, msg=f"batch={bs}", printLog=False
+                    )
+                    verdict = "PASS" if mismatch == 0 else f"WARN (mismatch={mismatch:.1%})"
+                    print(f"    Correctness: {verdict}")
+            except Exception as e:
+                print(f"  HK FP8+Fused:   Failed - {e}")
+        
+        # HipKittens FP8 + Fused Activation + No Atomics (EXPERIMENTAL)
+        hk_noatomic_us, hk_noatomic_tf = float('inf'), 0
+        if compare_noatomic and HIPKITTENS_FP8_AVAILABLE:
+            try:
+                hk_noatomic_out, hk_noatomic_us = bench_hipkittens_fp8_noatomic(hidden, w1_fp8, w2_fp8, w1_scale, w2_scale, topk_w, topk_ids)
+                hk_noatomic_tf = flops / (hk_noatomic_us * 1e-6) / 1e12
+                speedup_vs_fused = hk_fused_us / hk_noatomic_us if hk_noatomic_us > 0 else 0
+                print(f"  HK NoAtomic:    {hk_noatomic_us:8.2f} us, {hk_noatomic_tf:6.2f} TFLOPs ({speedup_vs_fused:.2f}x vs fused)")
+                
+                if ref_out is not None:
+                    mismatch = checkAllclose(
+                        ref_out, hk_noatomic_out, rtol=0.05, atol=0.1, msg=f"batch={bs}", printLog=False
+                    )
+                    verdict = "PASS" if mismatch == 0 else f"WARN (mismatch={mismatch:.1%})"
+                    print(f"    Correctness: {verdict}")
+            except Exception as e:
+                print(f"  HK NoAtomic:    Failed - {e}")
+        
+        results.append({
+            "batch": bs, 
+            "hk_fp8_us": hk_fp8_us, "hk_fp8_tf": hk_fp8_tf,
+            "hk_fused_us": hk_fused_us, "hk_fused_tf": hk_fused_tf,
+            "hk_noatomic_us": hk_noatomic_us, "hk_noatomic_tf": hk_noatomic_tf,
+        })
     
     print(f"\n{'='*70}")
-    print(f"{'Batch':>8} | {'HK FP8 (us)':>12} | {'TFLOPs':>8}")
-    print("-" * 35)
-    for r in results:
-        print(f"{r['batch']:>8} | {r['hk_fp8_us']:>12.2f} | {r['hk_fp8_tf']:>8.2f}")
+    if compare_fused_act:
+        print(f"{'Batch':>8} | {'FP8 (us)':>10} | {'TFLOPs':>7} | {'Fused (us)':>10} | {'TFLOPs':>7} | {'Speedup':>7}")
+        print("-" * 70)
+        for r in results:
+            sp = f"{r['hk_fp8_us']/r['hk_fused_us']:.2f}x" if r['hk_fused_us'] < float('inf') else "N/A"
+            print(f"{r['batch']:>8} | {r['hk_fp8_us']:>10.2f} | {r['hk_fp8_tf']:>7.2f} | {r['hk_fused_us']:>10.2f} | {r['hk_fused_tf']:>7.2f} | {sp:>7}")
+    else:
+        print(f"{'Batch':>8} | {'HK FP8 (us)':>12} | {'TFLOPs':>8}")
+        print("-" * 35)
+        for r in results:
+            print(f"{r['batch']:>8} | {r['hk_fp8_us']:>12.2f} | {r['hk_fp8_tf']:>8.2f}")
+
+
+def profile_stages(batch_sizes, cfg, num_iters=10):
+    """Profile individual Stage1 and Stage2 timing using CUDA events."""
+    from aiter.fused_moe import moe_sorting
+    from aiter.hipkittens_moe import hipkittens_moe_sorting
+    
+    # Import C++ module for direct stage calls
+    try:
+        from aiter.hipkittens_moe import _HK_MOE_MODULE
+        from aiter.jit.core import compile_ops
+    except ImportError:
+        print("Cannot import HipKittens module for stage profiling")
+        return
+    
+    print(f"\n{'='*70}")
+    print(f"HipKittens MoE Stage Profiling (FP8 Fused Activation)")
+    print(f"Config: model_dim={cfg['model_dim']}, inter_dim={cfg['inter_dim']}")
+    print(f"        experts={cfg['num_experts']}, topk={cfg['topk']}")
+    print(f"{'='*70}\n")
+    
+    for bs in batch_sizes:
+        print(f"\n--- Batch: {bs} tokens ---")
+        
+        try:
+            hidden, w1_bf16, w2_bf16, w1_fp8, w2_fp8, w1_scale, w2_scale, topk_w, topk_ids = create_fp8_inputs(bs, cfg)
+        except Exception as e:
+            print(f"  Setup failed: {e}")
+            continue
+        
+        # Run full fused kernel and profile with CUDA events
+        # Warmup
+        for _ in range(3):
+            _ = hipkittens_fused_moe_fp8_fused_act(hidden, w1_fp8, w2_fp8, w1_scale, w2_scale, topk_w, topk_ids)
+            torch.cuda.synchronize()
+        
+        # Profile full kernel
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        
+        torch.cuda.synchronize()
+        start_event.record()
+        for _ in range(num_iters):
+            _ = hipkittens_fused_moe_fp8_fused_act(hidden, w1_fp8, w2_fp8, w1_scale, w2_scale, topk_w, topk_ids)
+        end_event.record()
+        torch.cuda.synchronize()
+        
+        total_us = start_event.elapsed_time(end_event) * 1000 / num_iters  # ms to us
+        flops = calc_flops(bs, cfg)
+        tflops = flops / (total_us * 1e-6) / 1e12
+        
+        print(f"  Total FP8+Fused: {total_us:.2f} us, {tflops:.2f} TFLOPs")
+        
+        # Profile with markers using rocprof (if available)
+        # For now, we output the total timing - detailed stage breakdown requires rocprof
 
 
 if __name__ == "__main__":
@@ -296,14 +421,19 @@ if __name__ == "__main__":
     parser.add_argument("--quick", action="store_true", help="Quick run")
     parser.add_argument("--fp8", action="store_true", help="Run FP8 blockscale benchmark")
     parser.add_argument("--deepseek-r1", action="store_true", help="Use DeepSeek R1 config (model_dim=7168, inter_dim=256, experts=256, topk=8)")
+    parser.add_argument("--profile-stages", action="store_true", help="Profile Stage1 vs Stage2 timing")
+    parser.add_argument("--noatomic", action="store_true", help="Also benchmark atomic-free Stage 2 variant")
     args = parser.parse_args()
     
-    if args.fp8:
+    if args.profile_stages:
+        cfg = DEEPSEEK_R1_CONFIG if args.deepseek_r1 else MOE_CONFIG
+        profile_stages(args.batch_sizes if not args.quick else [2048, 4096, 8192], cfg)
+    elif args.fp8:
         cfg = DEEPSEEK_R1_CONFIG if args.deepseek_r1 else MOE_CONFIG
         if args.quick:
-            run_fp8_benchmark([512, 1024, 2048], cfg)
+            run_fp8_benchmark([512, 1024, 2048], cfg, compare_noatomic=args.noatomic)
         else:
-            run_fp8_benchmark(args.batch_sizes, cfg)
+            run_fp8_benchmark(args.batch_sizes, cfg, compare_noatomic=args.noatomic)
     else:
         if args.quick:
             run_benchmark([1024, 4096, 8192])

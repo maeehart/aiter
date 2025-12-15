@@ -88,7 +88,11 @@
  *
  * The checklist below is ordered from "simplest conceptual simplification" to "bigger redesign".
  *
- * [PENDING] 1) Make token writes unique by writing to a per-(token, topk_slot) buffer (remove atomics entirely)
+ * [IMPLEMENTED - NO WIN] 1) Make token writes unique by writing to a per-(token, topk_slot) buffer
+ *    - Implemented as hk_moe_stage2_fp8_noatomic_kernel_mma + hk_moe_reduce_topk_kernel
+ *    - Result: 2-6% SLOWER than atomic version at 4k-8k batch
+ *    - Reason: Extra reduction kernel overhead + larger memory traffic for tmp_buffer
+ *    - Conclusion: Atomics are NOT the bottleneck due to good locality from expert sorting
  *    - Key observation: each routed row corresponds to one (token_id, topk_slot) pair.
  *      If `sorted_ids[row]` encodes the topk slot (common in MoE packings), then Stage2 can write:
  *
@@ -715,4 +719,315 @@ void dispatch_hk_moe_stage2_fp8(const moe_stage2_fp8_globals& g, float* output_f
         g.num_scale_n,
         g.num_scale_k
     );
+}
+
+// ============================================================================
+// EXPERIMENTAL: Atomic-Free Stage 2 Variant
+// ============================================================================
+//
+// This variant eliminates atomic operations by writing to a per-(token, slot)
+// buffer. The packed sorted_ids encodes: token_id (lower 24 bits) + topk_slot
+// (upper 8 bits), allowing unique write destinations for each sorted row.
+//
+// Memory layout for tmp_buffer: [num_tokens, topk, model_dim]
+//   - Write: tmp_buffer[(token_id * topk + slot) * model_dim + col]
+//   - Reduce: output[token, col] = Σ_{slot=0..topk-1} tmp[token, slot, col]
+//
+// Trade-off:
+//   - PRO: No atomic contention, better parallelism for high-collision scenarios
+//   - CON: Requires extra memory (num_tokens * topk * model_dim * 4 bytes)
+//   - CON: Extra reduction kernel launch
+//
+// For DeepSeek R1 (8k tokens, topk=8, model_dim=7168): ~1.87 GB temp buffer
+
+__global__ __launch_bounds__(s2_cfg::NUM_THREADS, 2)
+void hk_moe_stage2_fp8_noatomic_kernel_mma(
+    const bf16* __restrict__ intermediate,
+    const fp8_t* __restrict__ w2_fp8,
+    const float* __restrict__ w2_scale,
+    float* __restrict__ tmp_buffer,  // [num_tokens, topk, model_dim] - no atomics needed
+    const int32_t* __restrict__ sorted_ids,
+    const int32_t* __restrict__ sorted_expert_ids,
+    const int32_t* __restrict__ num_valid_ids,
+    const float* __restrict__ sorted_weights,
+    const int sorted_M,
+    const int num_tokens,
+    const int model_dim,
+    const int inter_dim,
+    const int inter_row_stride,
+    const int num_experts,
+    const int topk,
+    const int block_m_sorting,
+    const int num_m_blocks,
+    const int num_n_blocks,
+    const int num_scale_n,
+    const int num_scale_k
+) {
+    using namespace s2_cfg;
+    using namespace fp8_cfg;
+    
+    const int sorted_M_valid = num_valid_ids[0];
+    
+    extern __shared__ alignment_dummy __shm[];
+    shared_allocator al((int*)&__shm[0]);
+    
+    s2_st_tile (&As) = al.allocate<s2_st_tile>();
+    s2_st_tile (&Bs) = al.allocate<s2_st_tile>();
+    
+    rt_bf<REG_BLOCK, DOT_SLICE> a_tile, b_tile;
+    rt_fl<REG_BLOCK, REG_BLOCK, ducks::rt_layout::col> C_accum[2];
+    zero(C_accum[0]);
+    zero(C_accum[1]);
+    
+    // XCD-aware block scheduling (same as atomic version)
+    int wgid = (blockIdx.y * gridDim.x) + blockIdx.x;
+    const int NUM_WGS = gridDim.x * gridDim.y;
+    wgid = chiplet_transform_chunked(wgid, NUM_WGS, NUM_XCDS, WGM * WGM);
+    
+    if (wgid >= NUM_WGS) return;
+    
+    int pid_m = wgid / num_n_blocks;
+    int pid_n = wgid % num_n_blocks;
+    
+    if (pid_m >= num_m_blocks || pid_n >= num_n_blocks) return;
+    
+    const int row_start = pid_m * BLOCK_SIZE;
+    const int col_start = pid_n * BLOCK_SIZE;
+    
+    if (row_start >= sorted_M_valid || col_start >= model_dim) return;
+    
+    const int tile_id = row_start / block_m_sorting;
+    const int expert_id = sorted_expert_ids[tile_id];
+    
+    if (expert_id < 0 || expert_id >= num_experts) return;
+    
+    const fp8_t* w2_expert_fp8 = w2_fp8 + expert_id * (size_t)model_dim * inter_dim;
+    const float* w2_expert_scale = w2_scale + expert_id * (size_t)num_scale_n * num_scale_k;
+    
+    const int warp_id = warpid();
+    const int warp_row = warp_id / 4;
+    const int warp_col = warp_id % 4;
+    
+    const int num_k_tiles = (inter_dim + K_STEP - 1) / K_STEP;
+    
+    const int lane = threadIdx.x;
+    constexpr int VEC_SIZE = 8;
+    constexpr int TOTAL_VECS = (BLOCK_SIZE * K_STEP) / VEC_SIZE;
+    constexpr int VECS_PER_THREAD = TOTAL_VECS / NUM_THREADS;
+    
+    // Main GEMM loop (same as atomic version)
+    for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) {
+        const int k_start = k_tile * K_STEP;
+        
+        // Load A tile (bf16 intermediate)
+        uint32_t As_ptr = reinterpret_cast<uintptr_t>(&As.data[0]);
+        #pragma unroll
+        for (int v = 0; v < VECS_PER_THREAD; v++) {
+            int vec_idx = lane * VECS_PER_THREAD + v;
+            int flat_idx = vec_idx * VEC_SIZE;
+            int m = flat_idx / K_STEP;
+            int k = flat_idx % K_STEP;
+
+            int row = row_start + m;
+            float4 buf = {0.f, 0.f, 0.f, 0.f};
+            if (row < sorted_M_valid && (k_start + k + VEC_SIZE - 1) < inter_dim) {
+                buf = load_global_vec4(reinterpret_cast<const float4*>(
+                    &intermediate[row * inter_row_stride + k_start + k]
+                ));
+            }
+            store_shared_vec(As.idx(As_ptr, {m, k}), {buf.x, buf.y});
+            store_shared_vec(As.idx(As_ptr, {m, k + 4}), {buf.z, buf.w});
+        }
+
+        // Load B tile (FP8 with dequantization)
+        uint32_t Bs_ptr = reinterpret_cast<uintptr_t>(&Bs.data[0]);
+        #pragma unroll
+        for (int v = 0; v < VECS_PER_THREAD; v++) {
+            int vec_idx = lane * VECS_PER_THREAD + v;
+            int flat_idx = vec_idx * VEC_SIZE;
+            int n = flat_idx / K_STEP;
+            int k = flat_idx % K_STEP;
+
+            int col = col_start + n;
+            int k_global = k_start + k;
+            
+            float2 buf_lo = {0.f, 0.f};
+            float2 buf_hi = {0.f, 0.f};
+            
+            if (col < model_dim && (k_global + VEC_SIZE - 1) < inter_dim) {
+                int n_block = col / SCALE_BLOCK_N;
+                int k_block = k_global / SCALE_BLOCK_K;
+                float scale = w2_expert_scale[n_block * num_scale_k + k_block];
+                
+                const fp8_t* src = &w2_expert_fp8[col * inter_dim + k_global];
+                fp8x8_to_bf16x8_scaled(src, scale, buf_lo, buf_hi);
+            }
+            store_shared_vec(Bs.idx(Bs_ptr, {n, k}), {buf_lo.x, buf_lo.y});
+            store_shared_vec(Bs.idx(Bs_ptr, {n, k + 4}), {buf_hi.x, buf_hi.y});
+        }
+
+        __syncthreads();
+        
+        // MFMA compute
+        #pragma unroll
+        for (int kk = 0; kk < K_STEP / DOT_SLICE; kk++) {
+            load(a_tile, subtile_inplace<REG_BLOCK, DOT_SLICE>(As, {warp_row, kk}));
+            load(b_tile, subtile_inplace<REG_BLOCK, DOT_SLICE>(Bs, {warp_col, kk}));
+            
+            __builtin_amdgcn_sched_barrier(0);
+            asm volatile("s_waitcnt lgkmcnt(0)");
+            
+            __builtin_amdgcn_s_setprio(1);
+            mma_ABt(C_accum[0], a_tile, b_tile, C_accum[0]);
+            __builtin_amdgcn_s_setprio(0);
+            
+            __builtin_amdgcn_sched_barrier(0);
+            
+            load(a_tile, subtile_inplace<REG_BLOCK, DOT_SLICE>(As, {warp_row + 2, kk}));
+            
+            __builtin_amdgcn_sched_barrier(0);
+            asm volatile("s_waitcnt lgkmcnt(0)");
+            
+            __builtin_amdgcn_s_setprio(1);
+            mma_ABt(C_accum[1], a_tile, b_tile, C_accum[1]);
+            __builtin_amdgcn_s_setprio(0);
+            
+            __builtin_amdgcn_sched_barrier(0);
+        }
+        
+        __syncthreads();
+    }
+    
+    // === ATOMIC-FREE weighted write to per-(token, slot) buffer ===
+    // Key difference: extract topk_slot and write to unique location
+    const int out_row_base_0 = row_start + warp_row * 32;
+    const int out_row_base_1 = row_start + (warp_row + 2) * 32;
+    const int out_col_base = col_start + warp_col * 32;
+    const int lane_id = laneid();
+    const int row_off = 4 * (lane_id / 16);
+    const int col_off = lane_id % 16;
+    
+    auto scatter_noatomic = [&](const auto& C_tile, int base_row_start) {
+        #pragma unroll
+        for (int tile_row = 0; tile_row < 2; tile_row++) {
+            #pragma unroll
+            for (int tile_col = 0; tile_col < 2; tile_col++) {
+                const auto& tile = C_tile.tiles[tile_row][tile_col];
+                int base_row = base_row_start + tile_row * 16 + row_off;
+                int col = out_col_base + tile_col * 16 + col_off;
+                
+                if (col < model_dim) {
+                    float vals[4] = {tile.data[0].x, tile.data[0].y, tile.data[1].x, tile.data[1].y};
+                    
+                    #pragma unroll
+                    for (int r = 0; r < 4; r++) {
+                        int row = base_row + r;
+                        if (row < sorted_M_valid) {
+                            int packed_id = sorted_ids[row];
+                            int token_id = packed_id & 0xFFFFFF;
+                            int topk_slot = (packed_id >> 24) & 0xFF;
+                            float weight = sorted_weights[row];
+                            
+                            if (token_id >= 0 && token_id < num_tokens && topk_slot < topk) {
+                                float weighted_val = vals[r] * weight;
+                                // Direct write - no atomics! Each (token_id, topk_slot) is unique
+                                tmp_buffer[(token_id * topk + topk_slot) * model_dim + col] = weighted_val;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+    
+    scatter_noatomic(C_accum[0], out_row_base_0);
+    scatter_noatomic(C_accum[1], out_row_base_1);
+}
+
+// Reduction kernel: sum across topk slots
+// output[token, col] = Σ_{slot=0..topk-1} tmp_buffer[token, slot, col]
+__global__ void hk_moe_reduce_topk_kernel(
+    const float* __restrict__ tmp_buffer,  // [num_tokens, topk, model_dim]
+    float* __restrict__ output,            // [num_tokens, model_dim]
+    const int num_tokens,
+    const int model_dim,
+    const int topk
+) {
+    // Each thread handles one (token, col) pair
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_elements = num_tokens * model_dim;
+    
+    if (idx >= total_elements) return;
+    
+    const int token_id = idx / model_dim;
+    const int col = idx % model_dim;
+    
+    // Sum across topk slots
+    float sum = 0.0f;
+    #pragma unroll 8  // DeepSeek R1 uses topk=8
+    for (int slot = 0; slot < topk; slot++) {
+        sum += tmp_buffer[(token_id * topk + slot) * model_dim + col];
+    }
+    
+    output[idx] = sum;
+}
+
+// Dispatch function for atomic-free FP8 Stage 2
+void dispatch_hk_moe_stage2_fp8_noatomic(
+    const moe_stage2_fp8_globals& g,
+    float* tmp_buffer,    // [num_tokens, topk, model_dim]
+    float* output_fp32    // [num_tokens, model_dim]
+) {
+    using namespace s2_cfg;
+    
+    const int num_m_blocks = (g.sorted_M + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const int num_n_blocks = (g.model_dim + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    
+    // Stage 2 GEMM kernel (no atomics)
+    {
+        dim3 grid(num_n_blocks, num_m_blocks);
+        dim3 block(NUM_THREADS);
+        
+        size_t smem_size = 32768;
+        hipFuncSetAttribute((void*)hk_moe_stage2_fp8_noatomic_kernel_mma, 
+                            hipFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+        
+        hk_moe_stage2_fp8_noatomic_kernel_mma<<<grid, block, smem_size, g.stream>>>(
+            g.intermediate.raw_ptr,
+            g.w2_fp8,
+            g.w2_scale,
+            tmp_buffer,
+            g.sorted_ids,
+            g.sorted_expert_ids,
+            g.num_valid_ids,
+            g.sorted_weights,
+            g.sorted_M,
+            g.num_tokens,
+            g.model_dim,
+            g.inter_dim,
+            g.inter_row_stride,
+            g.num_experts,
+            g.topk,
+            g.block_m,
+            num_m_blocks,
+            num_n_blocks,
+            g.num_scale_n,
+            g.num_scale_k
+        );
+    }
+    
+    // Reduction kernel
+    {
+        const int total_elements = g.num_tokens * g.model_dim;
+        const int block_size = 256;
+        const int num_blocks = (total_elements + block_size - 1) / block_size;
+        
+        hk_moe_reduce_topk_kernel<<<num_blocks, block_size, 0, g.stream>>>(
+            tmp_buffer,
+            output_fp32,
+            g.num_tokens,
+            g.model_dim,
+            g.topk
+        );
+    }
 }
