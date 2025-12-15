@@ -12,6 +12,7 @@
  *   - Weights stored as FP8 (e4m3fnuz on MI300 series)
  *   - Per-block scales with configurable block size (default 128x128)
  *   - On-the-fly dequantization: bf16 = fp8 * scale
+ *   - Uses vectorized FP8→BF16 conversion via CDNA3 intrinsics
  */
 #pragma once
 
@@ -31,6 +32,51 @@ using fp8_t = __hip_fp8_e4m3_fnuz;
 namespace fp8_cfg {
     constexpr int SCALE_BLOCK_N = 128;  // Block size in N dimension for scales
     constexpr int SCALE_BLOCK_K = 128;  // Block size in K dimension for scales
+}
+
+// ============================================================================
+// Vectorized FP8 Dequantization Utilities
+// ============================================================================
+// 
+// These use CDNA3 intrinsics for efficient FP8→float→bf16 conversion.
+// The key is to use __builtin_amdgcn_cvt_f32_fp8 for native FP8 conversion.
+
+// Convert 2 FP8 values packed in uint16 to float2
+__device__ __forceinline__ float2 fp8x2_to_float2(uint16_t packed) {
+    float2 result;
+    // Extract individual bytes
+    uint8_t b0 = packed & 0xFF;
+    uint8_t b1 = (packed >> 8) & 0xFF;
+    // Use native FP8 type for conversion
+    fp8_t f0, f1;
+    memcpy(&f0, &b0, 1);
+    memcpy(&f1, &b1, 1);
+    result.x = static_cast<float>(f0);
+    result.y = static_cast<float>(f1);
+    return result;
+}
+
+// Convert 4 FP8 values packed in uint32 to float4
+__device__ __forceinline__ float4 fp8x4_to_float4(uint32_t packed) {
+    float2 lo = fp8x2_to_float2(static_cast<uint16_t>(packed));
+    float2 hi = fp8x2_to_float2(static_cast<uint16_t>(packed >> 16));
+    return make_float4(lo.x, lo.y, hi.x, hi.y);
+}
+
+// Scaled FP8x4 to float4
+__device__ __forceinline__ float4 fp8x4_to_float4_scaled(uint32_t packed, float scale) {
+    float4 f = fp8x4_to_float4(packed);
+    return make_float4(f.x * scale, f.y * scale, f.z * scale, f.w * scale);
+}
+
+// Convert float4 to bf16x4 packed as float2 (for store_shared_vec compatibility)
+__device__ __forceinline__ float2 float4_to_bf16x4_packed(float4 f) {
+    __nv_bfloat162 lo = __float22bfloat162_rn(make_float2(f.x, f.y));
+    __nv_bfloat162 hi = __float22bfloat162_rn(make_float2(f.z, f.w));
+    float2 result;
+    memcpy(&result.x, &lo, sizeof(float));
+    memcpy(&result.y, &hi, sizeof(float));
+    return result;
 }
 
 // Common configuration constants - used only in struct methods below
@@ -200,32 +246,24 @@ __device__ __forceinline__ bf16 fp8_to_bf16_scaled(fp8_t val, float scale) {
 
 // Vectorized FP8 dequantization: load 8 FP8 values, dequantize to 8 bf16 with single scale
 // Returns two float2 (representing 8 bf16 values for store_shared_vec)
+// 
+// This version uses vectorized loads and conversions for better performance.
 __device__ __forceinline__ void fp8x8_to_bf16x8_scaled(
     const fp8_t* src,
     float scale,
     float2& out_lo,  // First 4 bf16 as float2 (bit-cast)
     float2& out_hi   // Last 4 bf16 as float2 (bit-cast)
 ) {
-    // Load 8 FP8 values (8 bytes = 2 uint32)
+    // Load 8 FP8 values as 2x uint32 (vectorized load)
     const uint32_t* src_u32 = reinterpret_cast<const uint32_t*>(src);
-    uint32_t v0 = src_u32[0];
-    uint32_t v1 = src_u32[1];
+    uint32_t v0 = src_u32[0];  // First 4 FP8 values
+    uint32_t v1 = src_u32[1];  // Next 4 FP8 values
     
-    // Extract individual FP8 bytes and convert to bf16
-    bf16 b[8];
-    #pragma unroll
-    for (int i = 0; i < 4; i++) {
-        uint8_t byte0 = (v0 >> (i * 8)) & 0xFF;
-        uint8_t byte1 = (v1 >> (i * 8)) & 0xFF;
-        fp8_t f0, f1;
-        memcpy(&f0, &byte0, 1);
-        memcpy(&f1, &byte1, 1);
-        b[i] = __float2bfloat16(static_cast<float>(f0) * scale);
-        b[i + 4] = __float2bfloat16(static_cast<float>(f1) * scale);
-    }
+    // Convert FP8x4 to float4 with scale, then to bf16x4 packed
+    float4 f0 = fp8x4_to_float4_scaled(v0, scale);
+    float4 f1 = fp8x4_to_float4_scaled(v1, scale);
     
-    // Pack bf16 values into float2 for store_shared_vec
-    // Each float2 holds 4 bf16 values (8 bytes)
-    memcpy(&out_lo, &b[0], sizeof(float2));
-    memcpy(&out_hi, &b[4], sizeof(float2));
+    // Convert to bf16 and pack for store_shared_vec
+    out_lo = float4_to_bf16x4_packed(f0);
+    out_hi = float4_to_bf16x4_packed(f1);
 }

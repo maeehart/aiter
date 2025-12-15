@@ -76,7 +76,7 @@
  *
  * The checklist below is ordered from "simplest conceptual simplification" to "bigger redesign".
  *
- * 1) Make token writes unique by writing to a per-(token, topk_slot) buffer (remove atomics entirely)
+ * [HIGH PRIORITY] 1) Make token writes unique by writing to a per-(token, topk_slot) buffer (remove atomics entirely)
  *    - Key observation: each routed row corresponds to one (token_id, topk_slot) pair.
  *      If `sorted_ids[row]` encodes the topk slot (common in MoE packings), then Stage2 can write:
  *
@@ -92,8 +92,9 @@
  *      Cost:
  *        - extra tmp buffer of size [num_tokens, topk, model_dim] (bf16 or fp32)
  *        - one additional reduction kernel (but extremely regular)
+ *    - For DeepSeek R1 (topk=8, model_dim=7168): tmp buffer = 8 × 7168 × num_tokens × 4B = ~230KB per 1K tokens
  *
- * 2) Two-pass “no-atomic Stage2”: write per-row output, then segmented reduce by token_id
+ * 2) Two-pass "no-atomic Stage2": write per-row output, then segmented reduce by token_id
  *    - Pass A: produce row-major output:
  *        row_out[row, out] = weight(row) * C[row, out]               (no atomic)
  *      Pass B: reduce by token_id(row) using a segmented reduction kernel.
@@ -121,6 +122,19 @@
  *    - Keep output_fp32 but consider:
  *        - reordering work to increase spatial locality (token clustering) so atomics hit fewer cache lines
  *        - using larger tiles over N to amortize metadata loads (sorted_ids/weights)
+ *
+ * === FP8-Specific Optimizations ===
+ *
+ * [DONE] 7) Vectorize FP8 dequantization (same as Stage1)
+ *    - Use vectorized fp8x8_to_bf16x8_scaled() for w2 weight loading.
+ *
+ * [TODO] 8) Cache w2 blockscales in LDS
+ *    - For DeepSeek R1: w2 is [256, 7168, 256], scales are [256, 56, 2]
+ *    - Each workgroup tile may access only 1-2 unique scale values.
+ *
+ * [TODO] 9) Consider fp32 accumulation earlier
+ *    - With FP8 weights, accumulation precision is more critical.
+ *    - Current: accumulate in fp32 registers (good), atomic to fp32 output (good).
  */
 #include "hk_moe_kernel.cuh"
 

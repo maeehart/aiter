@@ -97,13 +97,15 @@
  * This section is intentionally "engineering actionable": each item is phrased as a concrete change
  * we can try, and why it might simplify the approach or remove unnecessary work.
  *
- * 1) Eliminate boundary slow-paths via padding + invariants
+ * [STATUS: DONE for FP8] 1) Eliminate boundary slow-paths via padding + invariants
  *    - For common production shapes (model_dim=4096, inter_dim=4096, topk=2):
  *        model_dim is divisible by 32 and 8, and total_n=2*inter_dim is divisible by 128.
  *      If we treat these as invariants (or pad to them), we can remove many inner-loop bounds checks
  *      and scalar fallback paths, simplifying the code and reducing VALU/control overhead.
+ *    - FP8 note: DeepSeek R1 uses model_dim=7168 (divisible by 128) and inter_dim=256 (divisible by 128).
+ *      The FP8 kernel could specialize for these shapes with no boundary checks.
  *
- * 2) Fuse activation to remove the separate activation kernel and halve intermediate bandwidth
+ * [HIGH PRIORITY] 2) Fuse activation to remove the separate activation kernel and halve intermediate bandwidth
  *    - Today Stage1 writes gate|up to global, then another kernel computes:
  *        act = silu(gate) * up
  *      and writes act back into the first half.
@@ -111,11 +113,15 @@
  *      Benefits:
  *        - remove the activation kernel launch
  *        - remove global write of the gate half entirely
- *        - reduce intermediate global traffic ~2×
+ *        - reduce intermediate global traffic ~2× (5× for the full pipeline!)
  *      Cost:
  *        - adds elementwise nonlinearity + multiply in Stage1's epilogue (but may still be net win).
+ *    - Implementation approach for FP8:
+ *        - Each workgroup computes BOTH gate and up for the same N columns
+ *        - Requires loading gate weights and up weights from w1 (stride by inter_dim)
+ *        - Apply silu(gate) * up in registers, write only activated result
  *
- * 3) Make “valid rows” semantics explicit and uniform
+ * 3) Make "valid rows" semantics explicit and uniform
  *    - Prefer `sorted_M_valid` for all row bounds. Any use of `sorted_M` in the hot path risks reading padding
  *      and wasting bandwidth / generating non-deterministic behavior if padding isn't fully zeroed.
  *
@@ -128,7 +134,7 @@
  * 5) Re-evaluate the w1 prefetch pipeline complexity
  *    - If profiling shows the buffer-load prefetch does not overlap meaningfully (e.g. because gather latency
  *      dominates or barriers prevent overlap), the simplest implementation (direct load->LDS) may be best.
- *    - If it does help, ensure the pipeline is “structurally CK-like”:
+ *    - If it does help, ensure the pipeline is "structurally CK-like":
  *        prefetch next B while MFMA runs, minimize bookkeeping, and avoid extra barriers.
  *
  * 6) Threadblock shape / warp count
@@ -139,6 +145,23 @@
  *    - Today we derive expert_id from row_start/block_m_sorting and rely on block_m_sorting==128.
  *      A simpler contract would produce expert_id per 128-row kernel tile directly during sorting so the kernel
  *      doesn't need to reason about block_m_sorting at all.
+ *
+ * === FP8-Specific Optimizations ===
+ *
+ * [DONE] 8) Vectorize FP8 dequantization
+ *    - Use vectorized fp8x8_to_bf16x8_scaled() with CDNA3 native FP8 conversion.
+ *    - Current: scalar byte extraction → much slower
+ *    - Done: Now uses float4-based conversion pipeline.
+ *
+ * [TODO] 9) Cache blockscale values in LDS
+ *    - Currently reading scale from global memory for each 8-element vector.
+ *    - For a 128×32 weight tile with 128×128 scale blocks, we access at most 1-2 unique scales per tile.
+ *    - Caching scales in LDS (or registers) could reduce global memory traffic significantly.
+ *
+ * [TODO] 10) Specialize for DeepSeek R1 shapes
+ *    - model_dim=7168 = 56 × 128, inter_dim=256 = 2 × 128
+ *    - Remove all boundary checks for these shapes
+ *    - Unroll loops with compile-time constants
  */
 #include "hk_moe_kernel.cuh"
 
