@@ -57,6 +57,21 @@ USE_PYTORCH_REF = True
 # High batch sizes from CSV (tokens causing cache thrashing)
 HIGH_BATCH_SIZES = [480, 1547, 2907, 4132, 4644, 5913, 7339, 8613]
 
+# AITER production kernel timings from CSV (nanoseconds)
+# Kernel: aiter::fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_ps_32x256
+AITER_CSV_TIMINGS_NS = {
+    8613: 2469368.5,
+    7339: 1932024.0,
+    5913: 1677291.5,
+    4644: 1547635.0,
+    4132: 1291363.0,
+    2907: 984384.0,
+    2072: 811535.7,
+    1547: 599607.8,
+    1192: 522264.0,
+    480:  353069.0,
+}
+
 # MoE config from CSV: model_dim=7168, experts=256, topk=8
 # Note: Using smaller config for testing; scale up when GPU memory is sufficient
 MOE_CONFIG_FULL = {"model_dim": 7168, "inter_dim": 7168, "num_experts": 256, "topk": 8}
@@ -346,18 +361,23 @@ def run_fp8_benchmark(batch_sizes, cfg, compare_fused_act=True, compare_noatomic
             "hk_noatomic_us": hk_noatomic_us, "hk_noatomic_tf": hk_noatomic_tf,
         })
     
-    print(f"\n{'='*70}")
-    if compare_fused_act:
-        print(f"{'Batch':>8} | {'FP8 (us)':>10} | {'TFLOPs':>7} | {'Fused (us)':>10} | {'TFLOPs':>7} | {'Speedup':>7}")
-        print("-" * 70)
-        for r in results:
-            sp = f"{r['hk_fp8_us']/r['hk_fused_us']:.2f}x" if r['hk_fused_us'] < float('inf') else "N/A"
-            print(f"{r['batch']:>8} | {r['hk_fp8_us']:>10.2f} | {r['hk_fp8_tf']:>7.2f} | {r['hk_fused_us']:>10.2f} | {r['hk_fused_tf']:>7.2f} | {sp:>7}")
-    else:
-        print(f"{'Batch':>8} | {'HK FP8 (us)':>12} | {'TFLOPs':>8}")
-        print("-" * 35)
-        for r in results:
-            print(f"{r['batch']:>8} | {r['hk_fp8_us']:>12.2f} | {r['hk_fp8_tf']:>8.2f}")
+    print(f"\n{'='*80}")
+    print("SUMMARY: HipKittens vs AITER Production (from CSV)")
+    print("-" * 80)
+    print(f"{'Batch':>8} | {'AITER (us)':>10} | {'HK Fused (us)':>12} | {'Gap':>8} | {'TFLOPs':>7}")
+    print("-" * 80)
+    for r in results:
+        aiter_ns = AITER_CSV_TIMINGS_NS.get(r['batch'])
+        if aiter_ns and r['hk_fused_us'] < float('inf'):
+            aiter_us = aiter_ns / 1000.0
+            gap = r['hk_fused_us'] / aiter_us
+            print(f"{r['batch']:>8} | {aiter_us:>10.2f} | {r['hk_fused_us']:>12.2f} | {gap:>7.2f}x | {r['hk_fused_tf']:>7.2f}")
+        elif r['hk_fused_us'] < float('inf'):
+            print(f"{r['batch']:>8} | {'N/A':>10} | {r['hk_fused_us']:>12.2f} | {'N/A':>8} | {r['hk_fused_tf']:>7.2f}")
+    
+    print(f"\n{'='*80}")
+    print("Note: Gap > 1.0x means HipKittens is slower than AITER production.")
+    print("Target: Reduce gap to ~1.0x (match AITER) or <1.0x (beat AITER).")
 
 
 def profile_stages(batch_sizes, cfg, num_iters=10):
