@@ -167,10 +167,32 @@ void hk_moe_stage2_kernel_mma(
     constexpr int TOTAL_VECS = (BLOCK_SIZE * K_STEP) / VEC_SIZE;
     constexpr int VECS_PER_THREAD = TOTAL_VECS / NUM_THREADS;
     
+    // Outer K loop:
+    //   We advance k_start in steps of K_STEP and accumulate into fp32 registers (C_accum).
+    //
+    // After the loop finishes, for the workgroup's 128×128 (M×N) tile we have:
+    //   C[row, out] = Σ_{k=0..inter_dim-1} act[row, k] * w2[expert, out, k]
+    // where `row` is the sorted row index and `out` is the model_dim output column.
     for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) {
         const int k_start = k_tile * K_STEP;
         
-                // === Cooperative vectorized load input tile [BLOCK_SIZE x K_STEP] ===
+                // === Cooperative vectorized load of A tile into LDS ===
+        // A operand is the activated intermediate produced by Stage1.
+        // We read only the activated first half from the Stage1 buffer using a row stride:
+        //   act_ptr(row,k) = intermediate + row*inter_row_stride + k
+        //   inter_row_stride = 2*inter_dim (bf16 elements)
+        //
+        // Each workgroup loads a tile As = [BLOCK_SIZE, K_STEP] = [128,32].
+        //
+        // Vectorization:
+        //   VEC_SIZE = 8 bf16 = 16 bytes (float4 bits)
+        //   TOTAL_VECS      = 128*32/8 = 512 vectors
+        //   VECS_PER_THREAD = 512/512  = 1 vector per thread
+        //
+        // Lane mapping:
+        //   flat_idx = (lane*VECS_PER_THREAD + v) * 8
+        //   m = flat_idx / K_STEP   (row within the 128-row tile)
+        //   k = flat_idx % K_STEP   (k offset within the current K_STEP slice)
         uint32_t As_ptr = reinterpret_cast<uintptr_t>(&As.data[0]);
         #pragma unroll
         for (int v = 0; v < VECS_PER_THREAD; v++) {
@@ -190,7 +212,12 @@ void hk_moe_stage2_kernel_mma(
             store_shared_vec(As.idx(As_ptr, {m, k + 4}), {buf.z, buf.w});
         }
 
-        // === Cooperative vectorized load weight tile [BLOCK_SIZE x K_STEP] ===
+        // === Cooperative vectorized load of B tile (w2) into LDS ===
+        // B operand is the expert's down-projection weights w2[expert, out, k].
+        // We load B as [N=128, K_STEP] where N corresponds to output columns in this tile:
+        //   out = col_start + n
+        // Addressing for an in-bounds vector load:
+        //   &w2[expert_id, out, k_start+k] = w2 + expert_id*(model_dim*inter_dim) + out*inter_dim + (k_start+k)
         uint32_t Bs_ptr = reinterpret_cast<uintptr_t>(&Bs.data[0]);
         #pragma unroll
         for (int v = 0; v < VECS_PER_THREAD; v++) {
@@ -210,9 +237,14 @@ void hk_moe_stage2_kernel_mma(
             store_shared_vec(Bs.idx(Bs_ptr, {n, k + 4}), {buf.z, buf.w});
         }
 
-__syncthreads();
+        // Barrier: ensure all LDS writes to As/Bs are visible before any warp reads subtiles for MFMA.
+        __syncthreads();
         
-        // === Compute MMA ===
+        // === MFMA / MMA compute ===
+        // K_STEP=32 and DOT_SLICE=16 => kk ∈ {0,1} selecting k in [0..15] and [16..31].
+        // Warp mapping matches Stage1: warp_row selects which 64-row half; warp_col selects which 32-col quarter.
+        // We compute two 32×32 tiles by loading As at {warp_row,kk} and {warp_row+2,kk}.
+        // The explicit s_waitcnt lgkmcnt(0) ensures LDS->VGPR loads are complete before MFMA.
         #pragma unroll
         for (int kk = 0; kk < K_STEP / DOT_SLICE; kk++) {
             load(a_tile, subtile_inplace<REG_BLOCK, DOT_SLICE>(As, {warp_row, kk}));
@@ -242,7 +274,13 @@ __syncthreads();
         __syncthreads();
     }
     
-    // === Optimized Weighted scatter-add to output ===
+    // === Weighted scatter-add to output (atomic accumulation) ===
+    // We apply routing weights and accumulate into output_fp32 by token_id:
+    //   token_id(row) = sorted_ids[row] & 0x00FFFFFF
+    //   output_fp32[token_id, out] += sorted_weights[row] * C[row, out]
+    //
+    // Atomic rationale: topk>1 means multiple routed rows can map to the same token.
+    // Performance note: collisions on token_id (or cache lines) can serialize atomics.
     // Optimization 1: Local accumulation - if consecutive rows map to same token, accumulate first
     // Optimization 2: Prefetch sorted_ids and weights to reduce memory traffic
     // Optimization 3: Coalesce atomics by processing same token_id together
@@ -283,7 +321,8 @@ __syncthreads();
                         }
                     }
                     
-                                        // Scatter-add each row independently (correctness-first).
+                    // Scatter-add each row independently (correctness-first).
+                    // Future knob: if collisions dominate, consider warp-level reduction by token_id to reduce atomics.
                     #pragma unroll
                     for (int r = 0; r < 4; r++) {
                         int token_id = token_ids[r];
