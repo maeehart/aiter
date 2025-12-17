@@ -2,6 +2,11 @@
 """
 Fast benchmark for kernel optimization with correctness validation.
 
+⚠️ CRITICAL: AITER caches loaded kernels in GPU memory. Swapping .co files on 
+disk does NOT reload the kernel within the same process. Each kernel variant
+is tested by swapping the file and running the benchmark - this works because
+the FastBenchmark.test_variant() method runs while the file is swapped.
+
 Design goals:
 - Keep GPU saturated (minimal Python overhead)
 - Quick correctness check (single run comparison)

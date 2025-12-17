@@ -2,9 +2,19 @@
 
 ## Summary
 
-**Conclusion**: The ASM kernel is already highly optimized. After extensive testing of 
-15 s_waitcnt variants across multiple batch sizes (2048, 4096, 8192, 16384), 
-**no statistically significant performance improvements were found**.
+**⚠️ CRITICAL FINDINGS**:
+
+1. **AITER caches loaded kernels** - swapping .co files requires fresh subprocess
+2. **High variance (~3% std)** - results can vary ±6% from run-to-run noise
+3. **Ordering effects** - first kernel tested often appears slower (cache warm-up)
+
+**Results** (randomized ordering, 5 runs each at batch=8192):
+- baseline: 3291 ± 92 μs
+- opt_vmcnt_reduce25: 3307 ± 72 μs (0.995x - slightly slower)
+- opt_vmcnt_cap8: 3286 ± 82 μs (1.002x - essentially same)
+
+**Conclusion**: No statistically significant performance difference. The s_waitcnt 
+values are already well-tuned. Earlier "improvements" were ordering artifacts.
 
 All variants are **correct** (max_diff = 2.0, same as baseline's inherent variation).
 
