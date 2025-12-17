@@ -149,3 +149,57 @@ LDS stride optimization cannot be achieved via binary patching because:
 
 **Recommendation**: This optimization requires source-level changes to unify
 the address computation schemes before any stride modification can work.
+
+## Final Root Cause Analysis (Complete)
+
+### The Three-Component System
+
+The kernel's LDS addressing relies on THREE interrelated components:
+
+1. **Write base formula**: `((tid>>5)*32 + extra + (tid&15)*2) * 4 + s7*256`
+2. **Read base formula**: `((tid>>4)*64 + (tid&15)*2) * 4` (NO s7 term!)
+3. **Static offsets**: Hardcoded in each instruction (20736, 20864, 21760, etc.)
+
+### How They Work Together (3200 Mappings!)
+
+The static offsets COMPENSATE for the different formulas:
+
+| Write Thread | Write Base | Write Offset | Total | Read Thread | Read Base | Read Offset |
+|--------------|------------|--------------|-------|-------------|-----------|-------------|
+| W0 | 0 | 21760 | 21760 | R0 | 0 | 21760 |
+| W0 | 0 | 21760 | 21760 | R64 | 1024 | 20736 |
+| W0 | 0 | 22784 | 22784 | R128 | 2048 | 20736 |
+| W33 | 136 | 20736 | 20872 | R1 | 8 | 20864 |
+
+### Why Stride Change Breaks Everything
+
+When stride changes (32→31, 64→62):
+- Write base: 0 (unchanged for W0)
+- Read base for R64: 1024 → 992 (changed!)
+- Static offsets: UNCHANGED (hardcoded!)
+
+Result: W0(0) + 21760 = 21760, but R64(992) + 20736 = 21728 ≠ 21760
+
+### What Would Be Required
+
+To change stride from 32 to 31:
+1. Modify write base multiplier (32→31) ✓ We did this
+2. Modify read base multiplier (64→62) ✓ We did this  
+3. **Modify EVERY static offset in EVERY ds_read/ds_write instruction**
+   - 96+ LDS operations
+   - Each needs a DIFFERENT adjustment depending on which thread pairs it serves
+   - Some threads use the same instruction but need different adjustments!
+
+This is **mathematically impossible** to achieve with static offset values.
+The offsets would need to be thread-dependent, which they are not.
+
+### Conclusion
+
+LDS stride optimization for bank conflict reduction is **NOT achievable via binary patching** because:
+
+1. The addressing scheme uses three interrelated components
+2. Static offsets are designed specifically for stride 32/64
+3. Changing offsets would require thread-dependent values
+4. Instruction encoding only supports constant immediate offsets
+
+This optimization requires **source-level restructuring** of the entire LDS addressing scheme.
