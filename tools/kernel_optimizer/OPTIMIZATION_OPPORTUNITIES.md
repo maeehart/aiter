@@ -27,13 +27,14 @@ All variants are **correct** (max_diff = 2.0, same as baseline's inherent variat
 | VGPRs | 256 used (512 declared) | NOT the bottleneck |
 | ACCVGPRs | 128 | For MFMA operations |
 | SGPRs | 112 | Not the bottleneck |
-| **LDS** | **64 KB** | **THE BOTTLENECK** - uses entire CU LDS |
+| **LDS** | **52-56KB used (64KB declared)** | **THE BOTTLENECK** - can reduce to 56KB |
 | MFMA ops | 768 | Compute-heavy |
 | Atomics | 112 | Output accumulation |
 | Instruction mix | Excellent | MFMA interleaved with memory ops |
 
-**Key Finding**: LDS is the occupancy limiter. The kernel uses 100% of CU LDS,
-so only 1 workgroup can run per CU regardless of other resource usage.
+**Key Finding**: LDS is the occupancy limiter. The kernel uses 52-56KB LDS 
+(reducible from 64KB to 56KB for ~2% speedup), but still >32KB needed for 
+2 workgroups per CU.
 
 ---
 
@@ -76,9 +77,38 @@ Created 15 variants:
 - 320 VGPRs: ❌ Incorrect outputs
 - 256 VGPRs: ❌ Produces NaNs
 
+---
+
+## LDS Reduction Testing ✅ TESTED - SMALL IMPROVEMENT
+
+**Experiment:**
+- Modified both kernel descriptor (0x1d00) AND ELF metadata (0x1a76)
+- Must modify both locations for changes to take effect!
+
+**Analysis:**
+- Declared LDS: 64KB
+- Max LDS offset in code: 52.1KB
+- Actual usable minimum: ~56KB
+
+**Results:**
+| LDS Size | Correctness | Performance |
+|----------|-------------|-------------|
+| 64KB (orig) | ✓ | Baseline |
+| 56KB | ✓ | **1.021x** (2% faster) |
+| 48KB | ✗ WRONG | Data corruption |
+| 32KB | ✗ WRONG | Data corruption |
+
+**Conclusion:**
+- Can safely reduce LDS from 64KB to 56KB
+- ~2% improvement (marginal but measurable)
+- Cannot reach <32KB needed for 2 workgroups/CU
+- The kernel genuinely needs 52-56KB LDS for its algorithm
+
+---
+
 **Why no improvement with 384 VGPRs?**
-The kernel uses **64KB LDS** (`group_segment_fixed_size: 65536`), which is the 
-**entire LDS capacity** of an MI300X CU. This means:
+The kernel uses **52-56KB LDS** (reducible from 64KB). This is still above the 32KB 
+threshold needed for 2 workgroups per CU, so:
 - Only 1 workgroup can run per CU regardless of VGPR count
 - VGPRs are NOT the occupancy bottleneck - LDS is!
 - Reducing VGPRs cannot improve occupancy
