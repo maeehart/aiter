@@ -91,3 +91,61 @@ This requires:
 
 - [AMD CK-Tile LDS Bank Conflict Blog](https://rocm.blogs.amd.com/software-tools-optimization/lds-bank-conflict/README.html)
 - [ROCm Workload Optimization Guide](https://rocm.docs.amd.com/en/latest/how-to/rocm-for-ai/inference-optimization/workload.html)
+
+## Root Cause Analysis (Final)
+
+### The Real Problem: v56 vs v5 Mismatch
+
+The kernel has two separate data flows that share LDS space:
+
+1. **v4-based flow**: Uses stride 34
+   - Write: v4 = (34 * (tid>>4) + 2*(tid&15) + s7*136) << 2
+   - Read: v5 = (34 * (tid>>1) + (tid&1) + s7*2) << 2
+   - These stay aligned when stride changes (both shift proportionally)
+
+2. **v56-based flow**: Does NOT use stride 34
+   - Write: v56 = ((tid&15)<<1 + (tid>>5)<<5) << 2 + 256*s7
+   - Read: v5 = (34 * (tid>>1) + (tid&1) + s7*2) << 2
+   - **THESE BREAK** when stride changes!
+
+### Communication Pairs Broken
+
+| Writer (v56) | Reader (v5@34) | Reader (v5@33) | Status |
+|--------------|----------------|----------------|--------|
+| W0 → addr 0 | R0 → addr 0 | R0 → addr 0 | ✓ OK |
+| W33 → addr 136 | R2 → addr 136 | R2 → addr 132 | ✗ BROKEN |
+| W66 → addr 272 | R4 → addr 272 | R4 → addr 264 | ✗ BROKEN |
+| W99 → addr 408 | R6 → addr 408 | R6 → addr 396 | ✗ BROKEN |
+
+### Why NaN Occurs
+
+When stride changes:
+- v56 writes to address 136 (unchanged formula)
+- v5 reads from address 132 (shifted by -4)
+- Reader gets uninitialized/garbage data → NaN
+
+### What Would Be Required
+
+To properly change the stride, we need to modify v56's formula to be compatible.
+Current v56: `((tid&15)<<1 + (tid>>5)<<5) << 2`
+
+This formula has NO stride parameter - it's a completely different indexing scheme.
+To make it compatible with stride 33, we'd need to:
+
+1. Replace the entire computation chain (5+ instructions)
+2. Derive a new formula that maintains the same thread communication pattern
+3. Handle the s7*256 scalar addition separately
+
+This is beyond practical binary patching.
+
+## Final Conclusion
+
+LDS stride optimization cannot be achieved via binary patching because:
+1. The kernel uses multiple independent address formulas
+2. v56 writes use a formula completely unrelated to stride 34
+3. v5 reads depend on stride 34
+4. Changing stride breaks v56-to-v5 data flow
+5. Fixing v56's formula requires replacing entire computation chains
+
+**Recommendation**: This optimization requires source-level changes to unify
+the address computation schemes before any stride modification can work.
