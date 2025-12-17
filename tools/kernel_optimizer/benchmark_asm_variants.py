@@ -166,6 +166,7 @@ def create_plots(all_results: dict, output_dir: str):
         'vmcnt_reduce25': '#43a047',
         'vmcnt_cap4': '#8e24aa',
         'vmcnt_cap8': '#fb8c00',
+        'both_reduce50': '#00acc1',  # Teal for combined optimization
     }
     
     # =========================================================================
@@ -426,6 +427,7 @@ def main():
         'opt_vmcnt_reduce25': f"{ORIGINAL_KERNEL.replace('.co', '')}_opt_vmcnt_reduce25.co",
         'opt_vmcnt_cap4': f"{ORIGINAL_KERNEL.replace('.co', '')}_opt_vmcnt_cap4.co",
         'opt_vmcnt_cap8': f"{ORIGINAL_KERNEL.replace('.co', '')}_opt_vmcnt_cap8.co",
+        'opt_both_reduce50': f"{ORIGINAL_KERNEL.replace('.co', '')}_opt_both_reduce50.co",
     }
     
     all_results = {}
