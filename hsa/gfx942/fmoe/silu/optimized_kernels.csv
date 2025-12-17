@@ -1,0 +1,6 @@
+strategy,filename,description
+original,fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_32x256.co,Original unmodified kernel
+vmcnt_zero,fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_32x256_opt_vmcnt_zero.co,All vmcnt=0, best for 8K batch
+vmcnt_reduce25,fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_32x256_opt_vmcnt_reduce25.co,vmcnt reduced by 25%, best for 24K batch
+vmcnt_cap4,fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_32x256_opt_vmcnt_cap4.co,vmcnt capped at 4, good general purpose
+vmcnt_cap8,fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_32x256_opt_vmcnt_cap8.co,vmcnt capped at 8, moderate optimization
