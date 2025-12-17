@@ -24,12 +24,16 @@ All variants are **correct** (max_diff = 2.0, same as baseline's inherent variat
 
 | Resource | Value | Implication |
 |----------|-------|-------------|
-| VGPRs | 512 | 1 wave/SIMD (12.5% occupancy) |
+| VGPRs | 256 used (512 declared) | NOT the bottleneck |
+| ACCVGPRs | 128 | For MFMA operations |
 | SGPRs | 112 | Not the bottleneck |
-| LDS | 64 KB | Fully utilized |
+| **LDS** | **64 KB** | **THE BOTTLENECK** - uses entire CU LDS |
 | MFMA ops | 768 | Compute-heavy |
 | Atomics | 112 | Output accumulation |
 | Instruction mix | Excellent | MFMA interleaved with memory ops |
+
+**Key Finding**: LDS is the occupancy limiter. The kernel uses 100% of CU LDS,
+so only 1 workgroup can run per CU regardless of other resource usage.
 
 ---
 
@@ -61,11 +65,32 @@ Created 15 variants:
 
 ---
 
+## VGPR Reduction Testing ✅ TESTED - NO IMPROVEMENT
+
+**Experiment:**
+- Reduced VGPR count in COMPUTE_PGM_RSRC1 metadata
+- Created variants: 384, 320, 256 VGPRs
+
+**Results:**
+- 384 VGPRs: ✅ Correct, 0.999x performance (no change)
+- 320 VGPRs: ❌ Incorrect outputs
+- 256 VGPRs: ❌ Produces NaNs
+
+**Why no improvement with 384 VGPRs?**
+The kernel uses **64KB LDS** (`group_segment_fixed_size: 65536`), which is the 
+**entire LDS capacity** of an MI300X CU. This means:
+- Only 1 workgroup can run per CU regardless of VGPR count
+- VGPRs are NOT the occupancy bottleneck - LDS is!
+- Reducing VGPRs cannot improve occupancy
+
+---
+
 ## NOT Feasible via Binary Patching
 
 | Target | Reason |
 |--------|--------|
-| VGPR reduction | 512→256 would require complete rewrite |
+| VGPR reduction | Works but LDS is actual bottleneck |
+| LDS reduction | Would require algorithm rewrite |
 | LDS offsets | Already optimal stride pattern |
 | Barriers | Would break synchronization |
 | s_setvskip | Would break conditional execution |
