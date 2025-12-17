@@ -151,3 +151,37 @@ K0' = K0 ^ (M % (KPerBlock / Kpack * MLdsLayer))
 ```
 
 This is a source-level optimization that cannot be achieved via binary patching.
+
+## Stride Optimization Attempt
+
+### Attempted Changes
+
+1. v_mul_i32_i24_e32 v4, **34**, v56 → v_mul_i32_i24_e32 v4, **33**, v56
+2. v_mul_i32_i24_e32 v5, **34**, v56 → v_mul_i32_i24_e32 v5, **33**, v56  
+3. s_mul_i32 s60, s7, **0x88** → s_mul_i32 s60, s7, **0x84**
+
+### Result: Failed
+
+Output became NaN because:
+- Writes use v4 (modified stride)
+- Reads use v56 and v2 (different formulas, NOT stride-34 based)
+- Static offsets designed for stride 34 cause misalignment
+
+### Root Cause
+
+The kernel uses **multiple independent address computation paths**:
+- v4 for writes (modified)
+- v56 for some reads/writes (unmodified)
+- v2 for other reads (different formula entirely)
+
+Changing v4 and v5's stride without modifying v56 and v2's formulas 
+(and their static offsets) breaks data coherence.
+
+### Conclusion
+
+LDS stride optimization requires source-level changes to:
+1. Unify or coordinate all address computation paths
+2. Update all static offsets consistently
+3. Implement XOR swizzle for bank conflict avoidance
+
+This cannot be achieved via binary patching alone.
