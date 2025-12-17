@@ -75,3 +75,79 @@ the sparse addressing genuinely uses offsets up to 52KB.
    - Smaller tile sizes (16x128 instead of 32x256)
    - Would use ~16KB LDS → 4 workgroups per CU possible
    - Trade-off: Lower compute intensity per memory access
+
+## Bank Conflict Analysis
+
+### Current Bank Distribution
+
+According to [AMD's ROCm blog on LDS bank conflicts](https://rocm.blogs.amd.com/software-tools-optimization/lds-bank-conflict/README.html):
+- LDS has 32 banks, 4 bytes each
+- Bank conflicts serialize accesses and reduce throughput
+- XOR-based swizzle can eliminate conflicts without extra space
+
+**Current kernel analysis:**
+- Only uses 4 banks (0, 8, 16, 24) out of 32
+- Stride of 34 bytes causes poor bank distribution
+- 86.7% of LDS space is wasted due to sparse addressing
+
+### Stride Analysis
+
+```
+v4 = 34 * thread_id (via v_mul_i32_i24_e32 v4, 34, v56)
+
+Bank distribution with stride 34:
+  34 bytes = 8 dwords + 2 bytes
+  Thread 0: bank 0
+  Thread 1: bank (34/4) % 32 = 8
+  Thread 2: bank (68/4) % 32 = 17 -> wraps to 1? No...
+  
+Actually: (34 * N * 4) % 128 gives bank offset
+  N=0: 0 -> bank 0
+  N=1: 136 % 128 = 8 -> bank 2
+  N=2: 272 % 128 = 16 -> bank 4
+  N=3: 408 % 128 = 24 -> bank 6
+  Pattern: 0, 2, 4, 6, 0, 2, 4, 6... (4 banks)
+```
+
+### Attempted Optimization
+
+**Experiment:** Changed stride from 34 to 33
+- 33 is coprime to 32, would distribute across all banks
+- Modified bytes at 0x2914 and 0x2938 (0xA2 -> 0xA1)
+
+**Result:** ❌ FAILED
+- Output became NaN
+- The stride is tightly coupled with static offsets in ds_read/ds_write
+- Changing only the dynamic computation breaks data alignment
+
+### Why XOR Swizzle Can't Be Applied via Binary Patching
+
+1. **Coordinated changes required:**
+   - Address computation (v_mul_i32_i24)
+   - All static offsets (offset:XXXX in ds_read/ds_write)
+   - Both read and write paths must use same transformation
+
+2. **Need to insert instructions:**
+   - XOR swizzle requires `v_xor_b32` operations
+   - No free instruction slots available
+   - Cannot easily expand binary size
+
+3. **Complex dependency analysis:**
+   - Must understand full thread indexing scheme
+   - Data layout expectations across multiple computation stages
+
+### Recommendation for AITER Team
+
+The kernel would benefit significantly from implementing XOR-based LDS swizzle
+at the source level. Based on the AMD blog, this could:
+- Reduce LDS from 64KB to potentially <10KB
+- Enable 2+ workgroups per CU
+- Eliminate bank conflicts and improve bandwidth
+
+The CK-Tile framework (Composable Kernel) already supports this:
+```
+// XOR transformation (from AMD blog)
+K0' = K0 ^ (M % (KPerBlock / Kpack * MLdsLayer))
+```
+
+This is a source-level optimization that cannot be achieved via binary patching.
