@@ -5,6 +5,8 @@ Benchmark ASM kernel variants for MoE FP8 blockscale.
 Tests original and optimized ASM kernel variants by swapping kernel binaries.
 Creates performance comparison plots with clear distinction between original
 and optimized kernels.
+
+Includes p5/p50/p95 percentile tracking to understand variance.
 """
 
 import argparse
@@ -13,6 +15,7 @@ import json
 import shutil
 from datetime import datetime
 from pathlib import Path
+from typing import Dict, List, Tuple, Optional
 
 import torch
 import matplotlib
@@ -32,8 +35,12 @@ ORIGINAL_KERNEL = "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co"
 FP8_DTYPE = torch.float8_e4m3fnuz
 
 
-def run_single_benchmark(batch_size: int, num_warmup: int = 10, num_iters: int = 50) -> float:
-    """Run benchmark with current kernel configuration."""
+def run_single_benchmark(batch_size: int, num_warmup: int = 10, 
+                         num_iters: int = 50) -> Dict[str, float]:
+    """Run benchmark with current kernel configuration.
+    
+    Returns dict with keys: mean, p5, p50, p95, std, min, max
+    """
     from aiter.fused_moe import fused_moe, QuantType, ActivationType
     
     num_experts = 256
@@ -75,7 +82,7 @@ def run_single_benchmark(batch_size: int, num_warmup: int = 10, num_iters: int =
         )
         torch.cuda.synchronize()
     
-    # Benchmark
+    # Benchmark with timing
     start_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
     
@@ -91,13 +98,23 @@ def run_single_benchmark(batch_size: int, num_warmup: int = 10, num_iters: int =
         end_events[i].record()
     
     torch.cuda.synchronize()
-    times = [s.elapsed_time(e) * 1000 for s, e in zip(start_events, end_events)]
+    times = [s.elapsed_time(e) * 1000 for s, e in zip(start_events, end_events)]  # μs
     
-    return sum(times) / len(times)
+    times_arr = np.array(times)
+    return {
+        'mean': float(np.mean(times_arr)),
+        'p5': float(np.percentile(times_arr, 5)),
+        'p50': float(np.percentile(times_arr, 50)),
+        'p95': float(np.percentile(times_arr, 95)),
+        'std': float(np.std(times_arr)),
+        'min': float(np.min(times_arr)),
+        'max': float(np.max(times_arr)),
+        'cv': float(np.std(times_arr) / np.mean(times_arr) * 100),  # Coefficient of variation %
+    }
 
 
 def benchmark_kernel_variant(kernel_file: str, batch_sizes: list, 
-                            num_warmup: int, num_iters: int) -> dict:
+                            num_warmup: int, num_iters: int) -> Dict[int, Dict]:
     """Benchmark a kernel variant by temporarily replacing the original."""
     original_path = f"{KERNEL_DIR}/{ORIGINAL_KERNEL}"
     variant_path = f"{KERNEL_DIR}/{kernel_file}"
@@ -116,8 +133,8 @@ def benchmark_kernel_variant(kernel_file: str, batch_sizes: list,
     try:
         for bs in batch_sizes:
             try:
-                avg_us = run_single_benchmark(bs, num_warmup, num_iters)
-                results[bs] = avg_us
+                stats = run_single_benchmark(bs, num_warmup, num_iters)
+                results[bs] = stats
             except Exception as e:
                 print(f"  Error at batch {bs}: {e}")
                 results[bs] = None
@@ -130,7 +147,7 @@ def benchmark_kernel_variant(kernel_file: str, batch_sizes: list,
 
 
 def create_plots(all_results: dict, output_dir: str):
-    """Create performance comparison plots with clear original vs optimized distinction."""
+    """Create performance comparison plots with variance visualization."""
     os.makedirs(output_dir, exist_ok=True)
     
     batch_sizes = sorted(list(all_results.values())[0].keys())
@@ -140,216 +157,103 @@ def create_plots(all_results: dict, output_dir: str):
     original_kernels = [k for k in kernel_names if 'opt_' not in k]
     optimized_kernels = [k for k in kernel_names if 'opt_' in k]
     
-    # Style configurations
-    ORIGINAL_STYLE = {
-        'linestyle': '-',
-        'linewidth': 3,
-        'marker': 'o',
-        'markersize': 10,
-        'alpha': 1.0,
-    }
-    
-    OPTIMIZED_STYLE = {
-        'linestyle': '--',
-        'linewidth': 2.5,
-        'marker': 's',
-        'markersize': 8,
-        'alpha': 0.9,
-    }
-    
-    # Color palette - distinct colors for each variant
+    # Color palette
     COLORS = {
-        # Original kernels - blue shades
         'original': '#1e88e5',
-        # Optimized kernels - warm colors  
         'vmcnt_zero': '#e53935',
         'vmcnt_reduce25': '#43a047',
         'vmcnt_cap4': '#8e24aa',
         'vmcnt_cap8': '#fb8c00',
-        'both_reduce50': '#00acc1',  # Teal for combined optimization
+        'both_reduce50': '#00acc1',
     }
     
     # =========================================================================
-    # Plot 1: Main Performance Comparison
+    # Plot 1: Performance with Error Bars (p5-p95 range)
     # =========================================================================
     fig, ax = plt.subplots(figsize=(14, 9))
     
-    # Plot original kernels
-    for kernel in original_kernels:
-        times = [all_results[kernel].get(bs) for bs in batch_sizes]
-        color = COLORS.get(kernel, '#1e88e5')
-        ax.plot(batch_sizes, times, label=f'{kernel} (baseline)', 
-                color=color, **ORIGINAL_STYLE)
-    
-    # Plot optimized kernels
-    for kernel in optimized_kernels:
-        times = [all_results[kernel].get(bs) for bs in batch_sizes]
-        short_name = kernel.replace('opt_', '')
+    for kernel in kernel_names:
+        times = [all_results[kernel].get(bs, {}).get('mean') for bs in batch_sizes]
+        p5 = [all_results[kernel].get(bs, {}).get('p5') for bs in batch_sizes]
+        p95 = [all_results[kernel].get(bs, {}).get('p95') for bs in batch_sizes]
+        
+        short_name = kernel.replace('opt_', '') if 'opt_' in kernel else kernel
         color = COLORS.get(short_name, '#757575')
-        ax.plot(batch_sizes, times, label=f'{short_name} (optimized)', 
-                color=color, **OPTIMIZED_STYLE)
+        
+        is_opt = 'opt_' in kernel
+        linestyle = '--' if is_opt else '-'
+        marker = 's' if is_opt else 'o'
+        label = f'{short_name} {"(opt)" if is_opt else "(baseline)"}'
+        
+        # Plot with error bars showing p5-p95 range
+        ax.errorbar(batch_sizes, times, 
+                   yerr=[np.array(times) - np.array(p5), np.array(p95) - np.array(times)],
+                   label=label, color=color, linestyle=linestyle, marker=marker,
+                   linewidth=2.5, markersize=8, capsize=5, capthick=2, alpha=0.85)
     
     ax.set_xlabel('Batch Size (tokens)', fontsize=14, fontweight='bold')
     ax.set_ylabel('Latency (μs)', fontsize=14, fontweight='bold')
-    ax.set_title('MoE Kernel Performance: Original vs Optimized ASM Kernels\n'
+    ax.set_title('MoE Kernel Performance with Variance (p5-p95)\n'
                  'DeepSeek R1 TP8, FP8 blockscale [128,128]', 
                  fontsize=16, fontweight='bold')
-    
-    # Create legend with category headers
-    handles, labels = ax.get_legend_handles_labels()
-    
-    # Add category patches
-    orig_patch = mpatches.Patch(color='none', label='─── Original (solid)')
-    opt_patch = mpatches.Patch(color='none', label='--- Optimized (dashed)')
-    
-    ax.legend(loc='upper left', fontsize=11, framealpha=0.95)
-    ax.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
-    ax.set_xlim(min(batch_sizes) * 0.9, max(batch_sizes) * 1.05)
-    
-    # Add annotation for key finding
-    ax.annotate('Best optimized kernel shows\n2.7% speedup at 16K batch',
-                xy=(16000, all_results.get('opt_vmcnt_reduce25', {}).get(16000, 4500)),
-                xytext=(18000, 3500),
-                fontsize=10,
-                arrowprops=dict(arrowstyle='->', color='#43a047', lw=1.5),
-                bbox=dict(boxstyle='round,pad=0.3', facecolor='#e8f5e9', edgecolor='#43a047'))
-    
-    plt.tight_layout()
-    plt.savefig(f'{output_dir}/kernel_performance.png', dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"Saved: {output_dir}/kernel_performance.png")
-    
-    # =========================================================================
-    # Plot 2: Speedup vs Original
-    # =========================================================================
-    fig, ax = plt.subplots(figsize=(14, 8))
-    
-    baseline = all_results['original']
-    
-    for kernel in optimized_kernels:
-        speedups = []
-        for bs in batch_sizes:
-            if all_results[kernel].get(bs) and baseline.get(bs):
-                speedups.append(baseline[bs] / all_results[kernel][bs])
-            else:
-                speedups.append(1.0)
-        
-        short_name = kernel.replace('opt_', '')
-        color = COLORS.get(short_name, '#757575')
-        ax.plot(batch_sizes, speedups, label=short_name, 
-                color=color, **OPTIMIZED_STYLE)
-    
-    # Baseline line
-    ax.axhline(y=1.0, color='#1e88e5', linestyle='-', linewidth=3, 
-               label='original (baseline)', alpha=0.7)
-    
-    # Fill regions
-    ax.fill_between(batch_sizes, 1.0, [1.03]*len(batch_sizes), 
-                    alpha=0.1, color='green', label='_nolegend_')
-    ax.fill_between(batch_sizes, 0.97, 1.0, 
-                    alpha=0.1, color='red', label='_nolegend_')
-    
-    ax.set_xlabel('Batch Size (tokens)', fontsize=14, fontweight='bold')
-    ax.set_ylabel('Speedup vs Original', fontsize=14, fontweight='bold')
-    ax.set_title('Optimized Kernel Speedup vs Original ASM Kernel', 
-                 fontsize=16, fontweight='bold')
-    ax.legend(loc='best', fontsize=11)
+    ax.legend(loc='upper left', fontsize=10)
     ax.grid(True, alpha=0.3)
-    ax.set_ylim(0.95, 1.05)
-    
-    # Add text annotations
-    ax.text(batch_sizes[-1] * 0.95, 1.025, 'FASTER', fontsize=10, color='green', 
-            ha='right', va='bottom', fontweight='bold')
-    ax.text(batch_sizes[-1] * 0.95, 0.975, 'SLOWER', fontsize=10, color='red', 
-            ha='right', va='top', fontweight='bold')
     
     plt.tight_layout()
-    plt.savefig(f'{output_dir}/kernel_speedup.png', dpi=150, bbox_inches='tight')
+    plt.savefig(f'{output_dir}/kernel_performance_errorbars.png', dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"Saved: {output_dir}/kernel_speedup.png")
+    print(f"Saved: {output_dir}/kernel_performance_errorbars.png")
     
     # =========================================================================
-    # Plot 3: Grouped Bar Chart at Key Batch Sizes
+    # Plot 2: Coefficient of Variation Heatmap
     # =========================================================================
-    key_batches = [bs for bs in [1024, 4096, 8192, 16000, 24000] if bs in batch_sizes]
+    fig, ax = plt.subplots(figsize=(12, 6))
     
-    if key_batches:
-        fig, axes = plt.subplots(1, len(key_batches), figsize=(4.5*len(key_batches), 7))
-        if len(key_batches) == 1:
-            axes = [axes]
-        
-        for ax, bs in zip(axes, key_batches):
-            # Sort by performance (fastest first)
-            sorted_kernels = sorted(kernel_names, 
-                                   key=lambda k: all_results[k].get(bs, float('inf')))
-            
-            times = [all_results[k].get(bs, 0) for k in sorted_kernels]
-            
-            # Determine colors and edge styles
-            bar_colors = []
-            edge_colors = []
-            hatches = []
-            display_names = []
-            
-            for k in sorted_kernels:
-                short_name = k.replace('opt_', '') if 'opt_' in k else k
-                display_names.append(short_name)
-                
-                if 'opt_' in k:
-                    bar_colors.append(COLORS.get(short_name, '#757575'))
-                    edge_colors.append('black')
-                    hatches.append('//')  # Diagonal hatching for optimized
-                else:
-                    bar_colors.append(COLORS.get(k, '#1e88e5'))
-                    edge_colors.append('black')
-                    hatches.append('')  # No hatching for original
-            
-            bars = ax.barh(range(len(sorted_kernels)), times, color=bar_colors,
-                          edgecolor=edge_colors, linewidth=1.5)
-            
-            # Add hatching
-            for bar, hatch in zip(bars, hatches):
-                bar.set_hatch(hatch)
-            
-            ax.set_yticks(range(len(sorted_kernels)))
-            ax.set_yticklabels(display_names, fontsize=10)
-            ax.set_xlabel('Latency (μs)', fontsize=11)
-            ax.set_title(f'Batch {bs}', fontsize=13, fontweight='bold')
-            ax.invert_yaxis()
-            
-            # Add value labels
-            max_time = max(t for t in times if t)
-            for i, (bar, time) in enumerate(zip(bars, times)):
-                if time:
-                    # Determine if this is the best (fastest)
-                    is_best = (i == 0) and ('opt_' in sorted_kernels[i])
-                    label = f'{time:.0f}'
-                    if is_best:
-                        label += ' ★'
-                    ax.text(time + max_time * 0.02, bar.get_y() + bar.get_height()/2,
-                           label, va='center', fontsize=9, 
-                           fontweight='bold' if is_best else 'normal')
-            
-            ax.set_xlim(0, max_time * 1.2)
-        
-        # Add legend explaining hatching
-        solid_patch = mpatches.Patch(facecolor='#1e88e5', edgecolor='black', 
-                                     label='Original (baseline)')
-        hatch_patch = mpatches.Patch(facecolor='#43a047', edgecolor='black', 
-                                     hatch='//', label='Optimized')
-        fig.legend(handles=[solid_patch, hatch_patch], 
-                  loc='upper center', ncol=2, fontsize=11,
-                  bbox_to_anchor=(0.5, 1.02))
-        
-        plt.suptitle('Kernel Performance at Key Batch Sizes\n(★ = best optimized)', 
-                     fontsize=14, fontweight='bold', y=1.08)
-        plt.tight_layout()
-        plt.savefig(f'{output_dir}/kernel_bars.png', dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"Saved: {output_dir}/kernel_bars.png")
+    cv_matrix = []
+    kernel_labels = []
+    
+    for kernel in kernel_names:
+        short_name = kernel.replace('opt_', '') if 'opt_' in kernel else kernel
+        kernel_labels.append(short_name)
+        row = []
+        for bs in batch_sizes:
+            stats = all_results[kernel].get(bs, {})
+            cv = stats.get('cv', 0) if stats else 0
+            row.append(cv)
+        cv_matrix.append(row)
+    
+    cv_array = np.array(cv_matrix)
+    
+    im = ax.imshow(cv_array, cmap='YlOrRd', aspect='auto', vmin=0, vmax=10)
+    
+    ax.set_xticks(range(len(batch_sizes)))
+    ax.set_xticklabels([str(bs) for bs in batch_sizes], fontsize=10)
+    ax.set_yticks(range(len(kernel_labels)))
+    ax.set_yticklabels(kernel_labels, fontsize=11)
+    
+    cbar = plt.colorbar(im, ax=ax, shrink=0.8)
+    cbar.set_label('Coefficient of Variation (%)', fontsize=11)
+    
+    # Add annotations
+    for i in range(len(kernel_labels)):
+        for j in range(len(batch_sizes)):
+            value = cv_array[i, j]
+            color = 'white' if value > 5 else 'black'
+            ax.text(j, i, f'{value:.1f}%', ha='center', va='center', 
+                   color=color, fontsize=9, fontweight='bold')
+    
+    ax.set_xlabel('Batch Size', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Kernel Variant', fontsize=12, fontweight='bold')
+    ax.set_title('Run-to-Run Variance (Coefficient of Variation)\n'
+                 'Lower is more stable', fontsize=14, fontweight='bold')
+    
+    plt.tight_layout()
+    plt.savefig(f'{output_dir}/variance_heatmap.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {output_dir}/variance_heatmap.png")
     
     # =========================================================================
-    # Plot 4: Heatmap of Speedups
+    # Plot 3: Speedup Heatmap with reliable comparison
     # =========================================================================
     fig, ax = plt.subplots(figsize=(12, 6))
     
@@ -362,8 +266,11 @@ def create_plots(all_results: dict, output_dir: str):
         kernel_labels.append(short_name)
         row = []
         for bs in batch_sizes:
-            if all_results[kernel].get(bs) and baseline.get(bs):
-                speedup = (baseline[bs] / all_results[kernel][bs] - 1) * 100  # % improvement
+            opt_stats = all_results[kernel].get(bs, {})
+            base_stats = baseline.get(bs, {})
+            if opt_stats and base_stats:
+                # Use median for more robust comparison
+                speedup = (base_stats['p50'] / opt_stats['p50'] - 1) * 100
                 row.append(speedup)
             else:
                 row.append(0)
@@ -371,54 +278,91 @@ def create_plots(all_results: dict, output_dir: str):
     
     speedup_array = np.array(speedup_matrix)
     
-    # Create heatmap
-    im = ax.imshow(speedup_array, cmap='RdYlGn', aspect='auto', 
-                   vmin=-3, vmax=3)
+    im = ax.imshow(speedup_array, cmap='RdYlGn', aspect='auto', vmin=-5, vmax=5)
     
-    # Set ticks
     ax.set_xticks(range(len(batch_sizes)))
     ax.set_xticklabels([str(bs) for bs in batch_sizes], fontsize=10)
     ax.set_yticks(range(len(kernel_labels)))
     ax.set_yticklabels(kernel_labels, fontsize=11)
     
-    # Add colorbar
     cbar = plt.colorbar(im, ax=ax, shrink=0.8)
-    cbar.set_label('Improvement vs Original (%)', fontsize=11)
+    cbar.set_label('Improvement vs Original (%) [using p50]', fontsize=11)
     
-    # Add value annotations
     for i in range(len(kernel_labels)):
         for j in range(len(batch_sizes)):
             value = speedup_array[i, j]
-            color = 'white' if abs(value) > 1.5 else 'black'
+            color = 'white' if abs(value) > 2.5 else 'black'
             ax.text(j, i, f'{value:.1f}%', ha='center', va='center', 
                    color=color, fontsize=9, fontweight='bold')
     
     ax.set_xlabel('Batch Size', fontsize=12, fontweight='bold')
     ax.set_ylabel('Optimization Strategy', fontsize=12, fontweight='bold')
-    ax.set_title('Speedup Heatmap: % Improvement vs Original Kernel\n'
-                 '(Green = faster, Red = slower)', fontsize=14, fontweight='bold')
+    ax.set_title('Speedup Heatmap (Median-based for stability)\n'
+                 'Green = faster, Red = slower', fontsize=14, fontweight='bold')
     
     plt.tight_layout()
-    plt.savefig(f'{output_dir}/kernel_heatmap.png', dpi=150, bbox_inches='tight')
+    plt.savefig(f'{output_dir}/speedup_heatmap_p50.png', dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"Saved: {output_dir}/kernel_heatmap.png")
+    print(f"Saved: {output_dir}/speedup_heatmap_p50.png")
+    
+    # =========================================================================
+    # Plot 4: Box plot of variance by batch size (for selected kernels)
+    # =========================================================================
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    axes = axes.flatten()
+    
+    selected_batches = [bs for bs in [1024, 4096, 8192, 12000, 16000, 24000] if bs in batch_sizes][:6]
+    
+    for ax, bs in zip(axes, selected_batches):
+        data_for_box = []
+        labels = []
+        for kernel in ['original', 'opt_both_reduce50', 'opt_vmcnt_cap8']:
+            if kernel in all_results:
+                stats = all_results[kernel].get(bs, {})
+                if stats:
+                    # Create synthetic data for boxplot from percentiles
+                    data_for_box.append([stats['p5'], stats['p50'], stats['p95']])
+                    labels.append(kernel.replace('opt_', ''))
+        
+        positions = range(len(labels))
+        bp = ax.boxplot([[d[0], d[1], d[1], d[2]] for d in data_for_box], 
+                        positions=positions, widths=0.6, patch_artist=True)
+        
+        colors = ['#1e88e5', '#00acc1', '#fb8c00'][:len(labels)]
+        for patch, color in zip(bp['boxes'], colors):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.7)
+        
+        ax.set_xticks(positions)
+        ax.set_xticklabels(labels, fontsize=10)
+        ax.set_ylabel('Latency (μs)', fontsize=10)
+        ax.set_title(f'Batch {bs}', fontsize=12, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+    
+    plt.suptitle('Latency Distribution (p5, p50, p95) by Batch Size', 
+                fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(f'{output_dir}/variance_boxplots.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {output_dir}/variance_boxplots.png")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Benchmark ASM kernel variants')
+    parser = argparse.ArgumentParser(description='Benchmark ASM kernel variants with variance analysis')
     parser.add_argument('--batch-sizes', type=int, nargs='+',
                         default=[512, 1024, 2048, 4096, 8192, 12000, 16000, 20000, 24000])
-    parser.add_argument('--num-warmup', type=int, default=10)
-    parser.add_argument('--num-iters', type=int, default=50)
+    parser.add_argument('--num-warmup', type=int, default=15)
+    parser.add_argument('--num-iters', type=int, default=100,
+                        help='More iterations for better percentile accuracy')
     parser.add_argument('--output-dir', type=str, default='./benchmark_results')
     args = parser.parse_args()
     
-    print("=" * 80)
-    print("ASM Kernel Variants Benchmark")
-    print("=" * 80)
+    print("=" * 90)
+    print("ASM Kernel Variants Benchmark (with Variance Analysis)")
+    print("=" * 90)
     print(f"Batch sizes: {args.batch_sizes}")
     print(f"Warmup: {args.num_warmup}, Iterations: {args.num_iters}")
-    print("=" * 80)
+    print("=" * 90)
     
     # Kernel variants to test
     kernel_variants = {
@@ -435,7 +379,6 @@ def main():
     for name, kernel_file in kernel_variants.items():
         print(f"\n=== Benchmarking: {name} ===")
         
-        # Check if kernel file exists
         kernel_path = f"{KERNEL_DIR}/{kernel_file}"
         if not os.path.exists(kernel_path):
             print(f"  Kernel not found: {kernel_path}")
@@ -447,17 +390,19 @@ def main():
         )
         all_results[name] = results
         
-        # Print results
-        for bs, time in sorted(results.items()):
-            if time:
-                print(f"  Batch {bs:>6}: {time:>8.2f} μs")
+        # Print results with percentiles
+        for bs, stats in sorted(results.items()):
+            if stats:
+                print(f"  Batch {bs:>6}: mean={stats['mean']:>8.2f} μs, "
+                      f"p5={stats['p5']:>8.2f}, p50={stats['p50']:>8.2f}, "
+                      f"p95={stats['p95']:>8.2f}, CV={stats['cv']:.1f}%")
             else:
                 print(f"  Batch {bs:>6}: ERROR")
     
     # Save results
     os.makedirs(args.output_dir, exist_ok=True)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    results_file = f'{args.output_dir}/benchmark_results_{timestamp}.json'
+    results_file = f'{args.output_dir}/benchmark_results_detailed_{timestamp}.json'
     
     with open(results_file, 'w') as f:
         json.dump({
@@ -479,55 +424,68 @@ def main():
     if all_results:
         create_plots(all_results, args.output_dir)
     
-    # Print summary table
-    print("\n" + "=" * 100)
-    print("SUMMARY TABLE (μs)")
-    print("=" * 100)
+    # Print comprehensive summary table
+    print("\n" + "=" * 130)
+    print("SUMMARY TABLE with PERCENTILES (μs)")
+    print("=" * 130)
     
-    # Header
-    header = f"{'Batch':>8}"
-    for kernel in all_results:
-        header += f" | {kernel:>15}"
+    header = f"{'Batch':>8} | {'Kernel':>20} | {'Mean':>10} | {'P5':>10} | {'P50':>10} | {'P95':>10} | {'CV%':>6}"
     print(header)
     print("-" * len(header))
     
-    # Data rows
     for bs in args.batch_sizes:
-        row = f"{bs:>8}"
         for kernel in all_results:
-            time = all_results[kernel].get(bs, 0)
-            if time:
-                row += f" | {time:>15.2f}"
-            else:
-                row += f" | {'ERROR':>15}"
-        print(row)
+            stats = all_results[kernel].get(bs)
+            if stats:
+                print(f"{bs:>8} | {kernel:>20} | {stats['mean']:>10.2f} | "
+                      f"{stats['p5']:>10.2f} | {stats['p50']:>10.2f} | "
+                      f"{stats['p95']:>10.2f} | {stats['cv']:>5.1f}%")
+        print("-" * len(header))
     
-    # Speedup summary
+    # Speedup summary using P50 (more stable)
     if 'original' in all_results:
         print("\n" + "=" * 100)
-        print("SPEEDUP vs ORIGINAL")
+        print("SPEEDUP vs ORIGINAL (using P50 for stability)")
         print("=" * 100)
         header = f"{'Batch':>8}"
         for kernel in all_results:
             if kernel != 'original':
-                header += f" | {kernel:>15}"
+                short = kernel.replace('opt_', '')[:15]
+                header += f" | {short:>12}"
         print(header)
         print("-" * len(header))
         
         for bs in args.batch_sizes:
             row = f"{bs:>8}"
-            baseline = all_results['original'].get(bs)
+            baseline = all_results['original'].get(bs, {}).get('p50')
             for kernel in all_results:
                 if kernel != 'original':
-                    time = all_results[kernel].get(bs)
-                    if time and baseline:
-                        speedup = baseline / time
-                        row += f" | {speedup:>14.3f}x"
+                    opt = all_results[kernel].get(bs, {}).get('p50')
+                    if opt and baseline:
+                        speedup = baseline / opt
+                        row += f" | {speedup:>11.3f}x"
                     else:
-                        row += f" | {'N/A':>15}"
+                        row += f" | {'N/A':>12}"
             print(row)
+        
+        print("=" * 100)
     
-    print("=" * 100)
+    # Check for high variance and warn
+    print("\n" + "=" * 60)
+    print("VARIANCE CHECK")
+    print("=" * 60)
+    high_variance = []
+    for kernel in all_results:
+        for bs, stats in all_results[kernel].items():
+            if stats and stats['cv'] > 3:
+                high_variance.append((kernel, bs, stats['cv']))
+    
+    if high_variance:
+        print("⚠️  HIGH VARIANCE DETECTED (CV > 3%):")
+        for kernel, bs, cv in sorted(high_variance, key=lambda x: -x[2])[:10]:
+            print(f"   {kernel} @ batch {bs}: CV = {cv:.1f}%")
+    else:
+        print("✅ All measurements have acceptable variance (CV < 3%)")
 
 
 if __name__ == '__main__':
