@@ -430,7 +430,31 @@ direct_register_custom_op(
 MD_NAME = "module_mla_asm"
 
 
-@compile_ops(MD_NAME)
+# Fake implementations for MLA ops - needed for torch.compile/CUDA graphs support
+def gen_mla_decode_stage1_asm_fwd_fake(
+    Q: torch.Tensor,
+    KV: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    kv_last_page_lens: torch.Tensor,
+    num_kv_splits_indptr: Optional[torch.Tensor],
+    work_meta_data: Optional[torch.Tensor],
+    work_indptr: Optional[torch.Tensor],
+    work_info_set: Optional[torch.Tensor],
+    max_seqlen_q: int,
+    softmax_scale: float,
+    splitData: torch.Tensor,
+    splitLse: torch.Tensor,
+    output: torch.Tensor,
+    q_scale: Optional[torch.Tensor] = None,
+    kv_scale: Optional[torch.Tensor] = None,
+) -> None:
+    """Fake impl for torch.compile - outputs are written in-place, returns None."""
+    pass
+
+
+@compile_ops(MD_NAME, gen_fake=gen_mla_decode_stage1_asm_fwd_fake)
 def mla_decode_stage1_asm_fwd(
     # [num_seqs, num_heads, head_size]
     Q: torch.Tensor,
@@ -462,7 +486,23 @@ def mla_decode_stage1_asm_fwd(
 ) -> None: ...
 
 
-@compile_ops(MD_NAME)
+def gen_mla_prefill_asm_fwd_fake(
+    Q: torch.Tensor,
+    KV: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    kv_last_page_lens: torch.Tensor,
+    max_seqlen_q: int,
+    softmax_scale: float,
+    splitData: torch.Tensor,
+    splitLse: torch.Tensor,
+) -> None:
+    """Fake impl for torch.compile - outputs are written in-place, returns None."""
+    pass
+
+
+@compile_ops(MD_NAME, gen_fake=gen_mla_prefill_asm_fwd_fake)
 def mla_prefill_asm_fwd(
     # [num_seqs, num_heads, head_size]
     Q: torch.Tensor,
@@ -770,7 +810,21 @@ def get_mla_metadata_v1_no_redundant(
     ...
 
 
-@compile_ops("module_mla_reduce")
+def gen_mla_reduce_v1_fake(
+    partial_output: torch.Tensor,
+    partial_lse: torch.Tensor,
+    reduce_indptr: torch.Tensor,
+    reduce_final_map: Optional[torch.Tensor],
+    reduce_partial_map: torch.Tensor,
+    max_seqlen_q: int,
+    final_output: torch.Tensor,
+    final_lse: Optional[torch.Tensor] = None,
+) -> None:
+    """Fake impl for torch.compile - outputs are written in-place, returns None."""
+    pass
+
+
+@compile_ops("module_mla_reduce", gen_fake=gen_mla_reduce_v1_fake)
 def mla_reduce_v1(
     partial_output: torch.Tensor,
     partial_lse: torch.Tensor,
