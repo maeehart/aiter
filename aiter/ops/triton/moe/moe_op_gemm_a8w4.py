@@ -64,12 +64,15 @@ def allocate_output(
 
 
 _moe_a8w4_config_cache = {}
+_moe_a8w4_sorted_keys = None
+_moe_a8w4_lookup_cache = {}
 
 
 def _load_moe_a8w4_config():
-    """Load per-device tuned configs from JSON files in aiter/configs/moe_a8w4_configs/."""
-    if _moe_a8w4_config_cache:
-        return _moe_a8w4_config_cache.get("data")
+    """Load per-architecture tuned configs from aiter/configs/moe_a8w4_configs/."""
+    global _moe_a8w4_sorted_keys
+    if "data" in _moe_a8w4_config_cache:
+        return _moe_a8w4_config_cache["data"]
 
     import json
     import os
@@ -97,42 +100,59 @@ def _load_moe_a8w4_config():
     with open(config_file) as f:
         data = json.load(f)
 
+    _moe_a8w4_sorted_keys = sorted([int(k) for k in data.keys()])
     _moe_a8w4_config_cache["data"] = data
     return data
+
+
+def _lookup_tuned_config(num_tokens):
+    """Look up tuned config by num_tokens (input batch size). Cached."""
+    cached = _moe_a8w4_lookup_cache.get(num_tokens)
+    if cached is not None:
+        return cached
+
+    tuned = _load_moe_a8w4_config()
+    if tuned is None or _moe_a8w4_sorted_keys is None:
+        return None
+
+    import bisect
+    idx = bisect.bisect_right(_moe_a8w4_sorted_keys, num_tokens) - 1
+    if idx >= 0:
+        result = tuned[str(_moe_a8w4_sorted_keys[idx])]
+        _moe_a8w4_lookup_cache[num_tokens] = result
+        return result
+    return None
 
 
 def get_kernel_config(m, n, k, routing_data):
     block_m = routing_data.block_m
     num_xcds = 8
     xcd_swizzle = num_xcds
-    w_cache_modifier = ".cg" if block_m <= 32 else None
     split_k = 1
 
-    tuned = _load_moe_a8w4_config()
-    if tuned is not None:
-        best_key = None
-        for key in sorted(tuned.keys(), key=int):
-            if int(key) <= block_m:
-                best_key = key
-        if best_key is not None:
-            cfg = tuned[best_key]
-            return {
-                "block_m": block_m,
-                "block_n": cfg["block_n"],
-                "block_k": cfg.get("block_k", 256),
-                "num_warps": cfg["num_warps"],
-                "num_stages": cfg["num_stages"],
-                "group_m": cfg.get("group_m", 4),
-                "xcd_swizzle": xcd_swizzle,
-                "w_cache_modifier": w_cache_modifier,
-                "split_k": split_k,
-                "waves_per_eu": cfg.get("waves_per_eu", 0),
-                "matrix_instr_nonkdim": 16,
-                "kpack": 1,
-            }
+    # Look up tuned config by num_tokens (= m / topk)
+    num_tokens = m // routing_data.n_expts_act
+    cfg = _lookup_tuned_config(num_tokens)
+    if cfg is not None:
+        w_cache_modifier = ".cg" if block_m <= 32 else None
+        return {
+            "block_m": block_m,
+            "block_n": cfg["block_n"],
+            "block_k": cfg.get("block_k", 256),
+            "num_warps": cfg["num_warps"],
+            "num_stages": cfg["num_stages"],
+            "group_m": cfg.get("group_m", 4),
+            "xcd_swizzle": xcd_swizzle,
+            "w_cache_modifier": w_cache_modifier,
+            "split_k": split_k,
+            "waves_per_eu": cfg.get("waves_per_eu", 0),
+            "matrix_instr_nonkdim": 16,
+            "kpack": 1,
+        }
 
     # Default heuristics (no tuned config found)
     group_m = 4
+    w_cache_modifier = ".cg" if block_m <= 32 else None
     block_k = 256
     num_stages = 2
     waves_per_eu = 0
@@ -165,7 +185,7 @@ def get_kernel_config(m, n, k, routing_data):
         block_n = 512
         num_warps = 8
 
-    ret = {
+    return {
         "block_m": block_m,
         "block_n": block_n,
         "block_k": block_k,
@@ -179,7 +199,6 @@ def get_kernel_config(m, n, k, routing_data):
         "matrix_instr_nonkdim": 16,
         "kpack": 1,
     }
-    return ret
 
 
 def swizzle_scales(data):
