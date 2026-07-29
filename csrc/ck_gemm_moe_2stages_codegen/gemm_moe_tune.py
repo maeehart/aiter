@@ -92,6 +92,8 @@ TUNE_MOE_EXPERT_BALANCE = (
 )
 
 COS_DIFF_THRESHOLD = 1e-1
+SITUV2_DEFAULT_BETA = 1.0
+SITUV2_DEFAULT_LINEAR_BETA = 1.0
 
 
 def _manifest_flat_by_kernel(df: pd.DataFrame) -> dict:
@@ -338,6 +340,28 @@ class FmoeTuner(TunerCommon):
             default=None,
             help="Opus A8W4 stage2 tuner override for runtime inter_dim_pad. "
             "If omitted, Opus tunes real inter_dim (pad=0).",
+        )
+        self.parser.add_argument(
+            "--beta",
+            type=float,
+            default=None,
+            help="SiTUv2 gate beta. Defaults to the runtime SiTUv2 value when omitted.",
+        )
+        self.parser.add_argument(
+            "--linear-beta",
+            type=float,
+            default=None,
+            help="SiTUv2 linear beta. Defaults to the runtime SiTUv2 value when omitted.",
+        )
+
+    @staticmethod
+    def resolve_situv2_betas(beta=None, linear_beta=None):
+        """Return the one SiTUv2 parameter pair used by kernels and references."""
+        return (
+            SITUV2_DEFAULT_BETA if beta is None else float(beta),
+            SITUV2_DEFAULT_LINEAR_BETA
+            if linear_beta is None
+            else float(linear_beta),
         )
 
     @staticmethod
@@ -622,6 +646,8 @@ class FmoeTuner(TunerCommon):
         q_dtype_a,
         q_type,
         act_type,
+        situ_beta=SITUV2_DEFAULT_BETA,
+        situ_linear_beta=SITUV2_DEFAULT_LINEAR_BETA,
     ):
         act = (
             "swiglu"
@@ -658,6 +684,8 @@ class FmoeTuner(TunerCommon):
             xcd_swizzle=kparams.get("xcd_swizzle", 0),
             bias=bias,
             k_wave=kparams.get("k_wave", 1),
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
         if isinstance(result, tuple):
             out_raw = result[0]
@@ -1223,6 +1251,8 @@ class FmoeTuner(TunerCommon):
         blockM,
         stage=1,
         device="cuda",
+        situ_beta=SITUV2_DEFAULT_BETA,
+        situ_linear_beta=SITUV2_DEFAULT_LINEAR_BETA,
     ):
         _data = FmoeTuner.generate_data(
             token,
@@ -1414,6 +1444,8 @@ class FmoeTuner(TunerCommon):
                 quant_type=q_type,
                 doweight_stage1=doweight_stage1,
                 topk=topk,
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
             )
             # ref1 is always bf16
             ref1_bf16 = ref1
@@ -1626,6 +1658,8 @@ class FmoeTuner(TunerCommon):
         blockM=32,
         fuse_fp4=False,
         fuse_fp8=False,
+        situ_beta=SITUV2_DEFAULT_BETA,
+        situ_linear_beta=SITUV2_DEFAULT_LINEAR_BETA,
     ):
         # a16wi4: convert int8 weights to i4x2 so reference function detects the right path
         if (
@@ -1649,6 +1683,8 @@ class FmoeTuner(TunerCommon):
             w1_scale=w1_scale,
             w1_bias=w1_bias,
             doweight=doweight_stage1,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
         token_num = a1_qt.shape[0]
         if fuse_fp4:
@@ -1750,6 +1786,8 @@ class FmoeTuner(TunerCommon):
         quant_type,
         doweight_stage1,
         topk,
+        situ_beta=SITUV2_DEFAULT_BETA,
+        situ_linear_beta=SITUV2_DEFAULT_LINEAR_BETA,
     ):
         ref1 = FmoeTuner.run_torch_moe_stage1(
             a1_qt,
@@ -1764,6 +1802,8 @@ class FmoeTuner(TunerCommon):
             w1_scale=w1_scale,
             doweight_stage1=doweight_stage1,
             topk=topk,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
         token = a1_qt.shape[0]
         inter_dim = w2_qt.shape[-1]
@@ -1942,6 +1982,8 @@ class FmoeTuner(TunerCommon):
         activation=ActivationType.Silu,
         quant_type=QuantType.No,
         doweight_stage1=False,
+        situ_beta=SITUV2_DEFAULT_BETA,
+        situ_linear_beta=SITUV2_DEFAULT_LINEAR_BETA,
     ):
         ref1 = torch_moe_stage1(
             hidden_states,
@@ -1955,6 +1997,8 @@ class FmoeTuner(TunerCommon):
             a1_scale=a1_scale,
             w1_scale=w1_scale,
             doweight=doweight_stage1,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
         AQDType = hidden_states.dtype
 
@@ -2639,6 +2683,9 @@ class FmoeTuner(TunerCommon):
                                 doweight_stage1,
                                 blockM,
                                 1,
+                                "cuda",
+                                self.situ_beta,
+                                self.situ_linear_beta,
                             ),
                             FmoeTuner.ck_moe_stage1_fwd_out,  # func
                             (
@@ -2682,7 +2729,10 @@ class FmoeTuner(TunerCommon):
                                 topk,
                                 blockM,
                             ),
-                            {},
+                            {
+                                "situ_beta": self.situ_beta,
+                                "situ_linear_beta": self.situ_linear_beta,
+                            },
                             (None),
                             0.01,
                             0.01,
@@ -2727,6 +2777,9 @@ class FmoeTuner(TunerCommon):
                                 doweight_stage1,
                                 blockM,
                                 2,
+                                "cuda",
+                                self.situ_beta,
+                                self.situ_linear_beta,
                             ),
                             FmoeTuner.ck_moe_stage2_fwd_out,  # func
                             (
@@ -2818,7 +2871,14 @@ class FmoeTuner(TunerCommon):
                 (
                     (info, "stage1", cktile_s1_name, blockM),
                     FmoeTuner.generate_data_2stages,
-                    (*_gen_data_args_s1, blockM, 1),
+                    (
+                        *_gen_data_args_s1,
+                        blockM,
+                        1,
+                        "cuda",
+                        self.situ_beta,
+                        self.situ_linear_beta,
+                    ),
                     FmoeTuner.cktile_moe_stage1_out,
                     (
                         [
@@ -2859,7 +2919,10 @@ class FmoeTuner(TunerCommon):
                         topk,
                         blockM,
                     ),
-                    {},
+                    {
+                        "situ_beta": self.situ_beta,
+                        "situ_linear_beta": self.situ_linear_beta,
+                    },
                     (None),
                     0.01,
                     0.01,
@@ -2872,7 +2935,14 @@ class FmoeTuner(TunerCommon):
                 (
                     (info, "stage2", cktile_s2_name, blockM),
                     FmoeTuner.generate_data_2stages,
-                    (*_gen_data_args_s2, blockM, 2),
+                    (
+                        *_gen_data_args_s2,
+                        blockM,
+                        2,
+                        "cuda",
+                        self.situ_beta,
+                        self.situ_linear_beta,
+                    ),
                     FmoeTuner.cktile_moe_stage2_out,
                     (
                         [
@@ -3042,7 +3112,10 @@ class FmoeTuner(TunerCommon):
                         ref_args_extra = ref_args_extra + (False, True)
                     s1_ref_func = FmoeTuner.run_torch_moe_stage1
                     s1_ref_args = ref_args_extra
-                    s1_ref_kwargs = {}
+                    s1_ref_kwargs = {
+                        "situ_beta": self.situ_beta,
+                        "situ_linear_beta": self.situ_linear_beta,
+                    }
                     s1_ref = None
 
                     a1_key = "a1_qt_fp8_cast" if is_fp8 else "a1_qt"
@@ -3065,6 +3138,9 @@ class FmoeTuner(TunerCommon):
                                 doweight_stage1,
                                 blockM,
                                 1,
+                                "cuda",
+                                self.situ_beta,
+                                self.situ_linear_beta,
                             ),
                             FmoeTuner.run_flydsl_stage1_out,
                             (
@@ -3087,7 +3163,10 @@ class FmoeTuner(TunerCommon):
                                 q_type,
                                 act_type,
                             ),
-                            {},
+                            {
+                                "situ_beta": self.situ_beta,
+                                "situ_linear_beta": self.situ_linear_beta,
+                            },
                             s1_ref_func,
                             s1_ref_args,
                             s1_ref_kwargs,
@@ -3164,6 +3243,9 @@ class FmoeTuner(TunerCommon):
                             doweight_stage1,
                             blockM,
                             2,
+                                "cuda",
+                                self.situ_beta,
+                                self.situ_linear_beta,
                         ),
                         FmoeTuner.run_flydsl_stage2_out,
                         (
@@ -3432,6 +3514,9 @@ class FmoeTuner(TunerCommon):
                             doweight_stage1,
                             blockM,
                             1,
+                            "cuda",
+                            self.situ_beta,
+                            self.situ_linear_beta,
                         ),
                         FmoeTuner.run_flydsl_stage1_out,
                         (
@@ -3454,10 +3539,16 @@ class FmoeTuner(TunerCommon):
                             q_type,
                             act_type,
                         ),
-                        {},
+                        {
+                            "situ_beta": self.situ_beta,
+                            "situ_linear_beta": self.situ_linear_beta,
+                        },
                         FmoeTuner.run_torch_moe_stage1,
                         ref_args_extra,
-                        {},
+                        {
+                            "situ_beta": self.situ_beta,
+                            "situ_linear_beta": self.situ_linear_beta,
+                        },
                         (None),
                         0.01,
                         0.01,
@@ -3535,6 +3626,9 @@ class FmoeTuner(TunerCommon):
                             doweight_stage1,
                             blockM,
                             2,
+                            "cuda",
+                            self.situ_beta,
+                            self.situ_linear_beta,
                         ),
                         FmoeTuner.run_flydsl_stage2_out,
                         (
@@ -3574,6 +3668,9 @@ class FmoeTuner(TunerCommon):
         from aiter.fused_moe import fused_moe, fused_topk
         from aiter.test_common import run_perftest, checkAllclose
 
+        situ_beta, situ_linear_beta = self.resolve_situv2_betas(
+            args.beta, args.linear_beta
+        )
         untunedf = self.untunedf
         results = []
         for i in range(len(untunedf)):
@@ -3813,6 +3910,8 @@ class FmoeTuner(TunerCommon):
                     dtype=dtype,
                     num_warmup=args.warmup,
                     num_iters=args.iters,
+                    beta=situ_beta,
+                    linear_beta=situ_linear_beta,
                 )
                 # a16wi4: per_1x32_i4_quant stores int4 in an int8 container.
                 # The torch reference detects int4 weights by the i4x2 dtype, so
@@ -3835,6 +3934,8 @@ class FmoeTuner(TunerCommon):
                     activation=act_type,
                     quant_type=q_type,
                     doweight_stage1=doweight_stage1,
+                    situ_beta=situ_beta,
+                    situ_linear_beta=situ_linear_beta,
                 )
                 if out.count_nonzero() == 0 and ref.count_nonzero() > 0:
                     diag = tensor_compare_diagnostics(ref, out)
@@ -3937,6 +4038,9 @@ class FmoeTuner(TunerCommon):
         tunedf,
         args,
     ):
+        self.situ_beta, self.situ_linear_beta = self.resolve_situv2_betas(
+            args.beta, args.linear_beta
+        )
         mp_num = args.mp
         blockMs = [16, 32, 64, 128]
         keys = self.keys
