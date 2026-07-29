@@ -98,6 +98,13 @@ class TestFmoeSiTUv2Forwarding(unittest.TestCase):
         )
 
         stage2_data = _function(self.tree, "generate_data_2stages")
+        argument_names = [arg.arg for arg in stage2_data.args.args]
+        self.assertLess(
+            argument_names.index("situ_beta"), argument_names.index("device")
+        )
+        self.assertLess(
+            argument_names.index("situ_linear_beta"), argument_names.index("device")
+        )
         reference_calls = _calls(stage2_data, "run_torch_moe_stage1")
         self.assertEqual(len(reference_calls), 1)
         self.assertEqual(
