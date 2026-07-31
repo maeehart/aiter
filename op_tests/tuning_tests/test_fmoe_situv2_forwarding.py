@@ -13,7 +13,6 @@ import torch
 import aiter.fused_moe as fused_moe
 from aiter import ActivationType, QuantType, dtypes
 
-
 _TUNER = importlib.import_module("csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune")
 _MODEL_CONFIG = (
     Path(__file__).resolve().parents[2]
@@ -134,7 +133,9 @@ class TestFmoeSiTUv2Forwarding(unittest.TestCase):
             mock.patch.object(
                 _TUNER.FmoeTuner, "run_torch_moe_stage1", side_effect=fake_reference
             ),
-            mock.patch.object(_TUNER.fp4_utils, "e8m0_shuffle", side_effect=lambda x: x),
+            mock.patch.object(
+                _TUNER.fp4_utils, "e8m0_shuffle", side_effect=lambda x: x
+            ),
             mock.patch.object(
                 _TUNER.aiter,
                 "get_torch_quant",
@@ -165,6 +166,49 @@ class TestFmoeSiTUv2Forwarding(unittest.TestCase):
             (captured[0]["situ_beta"], captured[0]["situ_linear_beta"]), requested
         )
 
+    def test_a16wi4_splitk_selection_is_activation_safe(self):
+        original_cfg = fused_moe.cfg_2stages
+        fused_moe.cfg_2stages = None
+        fused_moe.get_2stage_cfgs.cache_clear()
+        try:
+            with (
+                mock.patch.object(
+                    fused_moe,
+                    "AITER_CONFIGS",
+                    SimpleNamespace(AITER_CONFIG_FMOE_FILE=str(_MODEL_CONFIG)),
+                ),
+                mock.patch.object(fused_moe, "get_gfx_runtime", return_value="gfx942"),
+                mock.patch.object(fused_moe, "get_cu_num", return_value=304),
+                mock.patch.object(fused_moe, "is_flydsl_available", return_value=True),
+                mock.patch.object(fused_moe, "get_ksplit", return_value=7),
+            ):
+                common = (
+                    1,
+                    3584,
+                    384,
+                    896,
+                    16,
+                    torch.bfloat16,
+                    torch.bfloat16,
+                    torch.int4,
+                    QuantType.per_1x32,
+                    True,
+                )
+                situv2 = fused_moe.get_2stage_cfgs(
+                    *common, ActivationType.Situv2, False, 0, 0
+                )
+                swiglu = fused_moe.get_2stage_cfgs(
+                    *common, ActivationType.Swiglu, False, 0, 0
+                )
+        finally:
+            fused_moe.cfg_2stages = original_cfg
+            fused_moe.get_2stage_cfgs.cache_clear()
+
+        self.assertEqual(situv2.ksplit, 7)
+        self.assertTrue(situv2.stage1.keywords["kernelName"].endswith("_kb7"))
+        self.assertEqual(swiglu.ksplit, 0)
+        self.assertFalse(swiglu.stage1.keywords["kernelName"].endswith("_kb7"))
+
     def test_committed_gfx942_rows_and_unlisted_control_select_expected_kernels(self):
         with tempfile.TemporaryDirectory() as tempdir:
             config = Path(tempdir) / "tuned_fmoe.csv"
@@ -179,9 +223,13 @@ class TestFmoeSiTUv2Forwarding(unittest.TestCase):
                         "AITER_CONFIGS",
                         SimpleNamespace(AITER_CONFIG_FMOE_FILE=str(config)),
                     ),
-                    mock.patch.object(fused_moe, "get_gfx_runtime", return_value="gfx942"),
+                    mock.patch.object(
+                        fused_moe, "get_gfx_runtime", return_value="gfx942"
+                    ),
                     mock.patch.object(fused_moe, "get_cu_num", return_value=304),
-                    mock.patch.object(fused_moe, "is_flydsl_available", return_value=True),
+                    mock.patch.object(
+                        fused_moe, "is_flydsl_available", return_value=True
+                    ),
                 ):
                     selected = {
                         topk: fused_moe.get_2stage_cfgs(
