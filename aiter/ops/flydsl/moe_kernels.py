@@ -414,6 +414,11 @@ def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> Dict[str, Dict]:
                         **base_params,
                         "persist": True,
                     }
+                    if tm in (32, 64):
+                        kernels[base_name + "_sbuf"] = {
+                            **base_params,
+                            "single_buffer_lds": True,
+                        }
     return kernels
 
 
@@ -579,6 +584,7 @@ def compile_flydsl_moe_stage2(
     sort_block_m: int = 0,
     waves_per_eu: Optional[int] = None,
     use_async_copy: bool = False,
+    single_buffer_lds: bool = False,
     cu_num_mul: int = 1,
     b_nt: int = 0,
     model_dim_pad: int = 0,
@@ -661,6 +667,7 @@ def compile_flydsl_moe_stage2(
             out_dtype=out_dtype,
             accumulate=accumulate,
             scale_is_bf16=True,
+            single_buffer_lds=single_buffer_lds,
         )
     else:
         raise ValueError(
@@ -1669,6 +1676,7 @@ def flydsl_moe_stage2(
     persist: Optional[bool] = None,
     waves_per_eu: Optional[int] = None,
     use_async_copy: bool = False,
+    single_buffer_lds: bool = False,
     cu_num_mul: int = 1,
     b_nt: int = 0,
     model_dim_pad: int = 0,
@@ -1840,6 +1848,7 @@ def flydsl_moe_stage2(
         sort_block_m=sort_block_m,
         waves_per_eu=waves_per_eu,
         use_async_copy=use_async_copy,
+        single_buffer_lds=single_buffer_lds,
         cu_num_mul=cu_num_mul,
         b_nt=b_nt,
         model_dim_pad=model_dim_pad,

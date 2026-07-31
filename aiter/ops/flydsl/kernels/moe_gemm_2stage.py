@@ -12,7 +12,6 @@ It is extracted from `tests/kernels/test_moe_gemm.py` so that:
 - `tests/` holds correctness/perf harnesses
 """
 
-import logging
 import os
 import functools
 from contextlib import contextmanager
@@ -98,13 +97,7 @@ def _stage1_activation_module_tag(
         return "_silu"
 
     def float_tag(value: float) -> str:
-        return (
-            float(value)
-            .hex()
-            .replace("-", "m")
-            .replace("+", "p")
-            .replace(".", "d")
-        )
+        return float(value).hex().replace("-", "m").replace("+", "p").replace(".", "d")
 
     return f"_situv2_sb{float_tag(situ_beta)}_slb{float_tag(situ_linear_beta)}"
 
@@ -171,9 +164,7 @@ def compile_moe_gemm1(
         if situ_beta <= 0.0:
             raise ValueError(f"situ_beta must be > 0, got {situ_beta!r}")
         if situ_linear_beta <= 0.0:
-            raise ValueError(
-                f"situ_linear_beta must be > 0, got {situ_linear_beta!r}"
-            )
+            raise ValueError(f"situ_linear_beta must be > 0, got {situ_linear_beta!r}")
 
     # NOTE: don't materialize MLIR types outside an active MLIR Context.
     def out_mlir():
@@ -223,8 +214,7 @@ def compile_moe_gemm1(
     if _is_splitk:
         if act != "silu":
             raise NotImplementedError(
-                "split-K stage1 activation supports only 'silu', got "
-                f"{act!r}"
+                "split-K stage1 activation supports only 'silu', got " f"{act!r}"
             )
         _k_per_batch = model_dim // k_batch
         assert (
@@ -2070,6 +2060,7 @@ def compile_moe_gemm2(
     use_cshuffle_epilog: bool | None = None,
     accumulate: bool = True,
     scale_is_bf16: bool = False,
+    single_buffer_lds: bool = False,
 ):
     """Compile stage2 kernel (`moe_gemm2`) and return the compiled executable.
 
@@ -2090,6 +2081,22 @@ def compile_moe_gemm2(
     global atomics (recommended for performance).
     """
     gpu_arch = get_hip_arch()
+    if single_buffer_lds and not (
+        str(gpu_arch).startswith("gfx942")
+        and model_dim == 3584
+        and inter_dim == 384
+        and experts == 896
+        and topk == 16
+        and tile_m in (32, 64)
+        and (tile_n, tile_k) == (128, 128)
+        and in_dtype == "int4_bf16"
+        and str(out_dtype).strip().lower() in ("bf16", "bfloat16")
+        and accumulate
+    ):
+        raise ValueError(
+            "single-buffer A prefetch is only validated for the Kimi-K3 "
+            "gfx942 stage-2 shape"
+        )
     allocator = SmemAllocator(None, arch=gpu_arch)
     _state = {}
 
@@ -2291,7 +2298,10 @@ def compile_moe_gemm2(
             )
 
     # ── LDS sizing (pure Python; no MLIR Context needed) ─────────────────────
-    lds_x_bytes = 2 * int(tile_m) * int(lds_stride) * int(elem_bytes)
+    # The next A tile is prefetched into registers before the current tile
+    # computes, so the validated path can reuse one LDS tile after a barrier.
+    a_lds_buffers = 1 if single_buffer_lds else 2
+    lds_x_bytes = a_lds_buffers * int(tile_m) * int(lds_stride) * int(elem_bytes)
     lds_out_bytes = (
         2 * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
     )  # f16 bytes
@@ -3042,7 +3052,9 @@ def compile_moe_gemm2(
                 # ---------------- 2-stage pipeline (ping-pong LDS + B tile prefetch) ----------------
                 lds_tile_elems = arith.index(tile_m * lds_stride)
                 lds_base_cur = fx.Index(0)
-                lds_base_nxt = lds_tile_elems
+                lds_base_nxt = (
+                    fx.Index(0) if const_expr(single_buffer_lds) else lds_tile_elems
+                )
 
                 rocdl.sched_barrier(0)
 
@@ -3225,6 +3237,8 @@ def compile_moe_gemm2(
                     _bp = load_b_tile(next_k1)
 
                     _ac, _ = compute_tile(_ac, _bc, lds_base_pong, a0_prefetch=_a0)
+                    if const_expr(single_buffer_lds):
+                        gpu.barrier()
                     store_x_tile_to_lds(x_regs_ping, lds_base_ping)
                     hot_loop_scheduler()
                     gpu.barrier()
@@ -3238,6 +3252,8 @@ def compile_moe_gemm2(
                     _bn = load_b_tile(next_k2)
 
                     _ac, _ = compute_tile(_ac, _bp, lds_base_ping, a0_prefetch=_a0p)
+                    if const_expr(single_buffer_lds):
+                        gpu.barrier()
                     store_x_tile_to_lds(x_regs_pong, lds_base_pong)
                     hot_loop_scheduler()
                     gpu.barrier()
@@ -3271,6 +3287,8 @@ def compile_moe_gemm2(
                     acc, _ = compute_tile(
                         acc, b_cur, lds_base_pong, a0_prefetch=a0_prefetch_pong
                     )
+                    if const_expr(single_buffer_lds):
+                        gpu.barrier()
                     store_x_tile_to_lds(x_regs_ping, lds_base_ping)
                     hot_loop_scheduler()
                     gpu.barrier()
