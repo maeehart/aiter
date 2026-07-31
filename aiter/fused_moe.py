@@ -1297,6 +1297,7 @@ def _flydsl_stage2_wrapper(
         sort_block_m=parsed.get("sort_block_m", 0),
         waves_per_eu=parsed.get("waves_per_eu", None),
         use_async_copy=parsed.get("use_async_copy", False),
+        single_buffer_lds=parsed.get("single_buffer_lds", False),
         cu_num_mul=parsed.get("cu_num_mul", 1),
         b_nt=parsed.get("b_nt", 0),
         persist=parsed.get("persist", None),
@@ -2164,6 +2165,15 @@ def get_2stage_cfgs(
         #   - _ksplit: partitions the K dimension across workgroups for large reductions
         _out_str = "bf16"
         _tile_m = 16 if token < 2048 else 32 if token < 16384 else 64
+        use_stage2_sbuf = (
+            model_dim == 3584
+            and inter_dim == 384
+            and expert == 896
+            and topk == 16
+            and str(get_gfx()).startswith("gfx942")
+        )
+        if use_stage2_sbuf and token >= 8192:
+            _tile_m = 64
         _tile_n = 128
         _tile_k = 128
         _ksplit = get_ksplit(token, topk, expert, inter_dim, model_dim)
@@ -2175,6 +2185,8 @@ def get_2stage_cfgs(
         kn2 = flydsl_kernel_name(
             2, "bf16", "int4", _out_str, _tile_m, _tile_n, _tile_k, "atomic"
         )
+        if use_stage2_sbuf and _tile_m in (32, 64):
+            kn2 += "_sbuf"
         return MOEMetadata(
             functools.partial(
                 _flydsl_stage1_wrapper,

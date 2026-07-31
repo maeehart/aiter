@@ -12,7 +12,7 @@ import torch
 
 import aiter.fused_moe as fused_moe
 from aiter import ActivationType, QuantType, dtypes
-
+from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
 
 _TUNER = importlib.import_module("csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune")
 _MODEL_CONFIG = (
@@ -134,7 +134,9 @@ class TestFmoeSiTUv2Forwarding(unittest.TestCase):
             mock.patch.object(
                 _TUNER.FmoeTuner, "run_torch_moe_stage1", side_effect=fake_reference
             ),
-            mock.patch.object(_TUNER.fp4_utils, "e8m0_shuffle", side_effect=lambda x: x),
+            mock.patch.object(
+                _TUNER.fp4_utils, "e8m0_shuffle", side_effect=lambda x: x
+            ),
             mock.patch.object(
                 _TUNER.aiter,
                 "get_torch_quant",
@@ -165,6 +167,78 @@ class TestFmoeSiTUv2Forwarding(unittest.TestCase):
             (captured[0]["situ_beta"], captured[0]["situ_linear_beta"]), requested
         )
 
+    def test_kimi_prefill_single_buffer_selection_is_shape_gated(self):
+        original_cfg = fused_moe.cfg_2stages
+        fused_moe.cfg_2stages = None
+        fused_moe.get_2stage_cfgs.cache_clear()
+        try:
+            with (
+                mock.patch.object(
+                    fused_moe,
+                    "AITER_CONFIGS",
+                    SimpleNamespace(AITER_CONFIG_FMOE_FILE=str(_MODEL_CONFIG)),
+                ),
+                mock.patch.object(fused_moe, "get_gfx", return_value="gfx942"),
+                mock.patch.object(fused_moe, "get_gfx_runtime", return_value="gfx942"),
+                mock.patch.object(fused_moe, "get_cu_num", return_value=304),
+                mock.patch.object(fused_moe, "is_flydsl_available", return_value=True),
+            ):
+                common = (
+                    3584,
+                    torch.bfloat16,
+                    torch.bfloat16,
+                    torch.int4,
+                    QuantType.per_1x32,
+                    True,
+                    ActivationType.Situv2,
+                    False,
+                    0,
+                    0,
+                )
+                non_ep = fused_moe.get_2stage_cfgs(
+                    8192, common[0], 384, 896, 16, *common[1:]
+                )
+                non_ep_small = fused_moe.get_2stage_cfgs(
+                    4096, common[0], 384, 896, 16, *common[1:]
+                )
+                ep_control = fused_moe.get_2stage_cfgs(
+                    8192, common[0], 3072, 112, 14, *common[1:]
+                )
+        finally:
+            fused_moe.cfg_2stages = original_cfg
+            fused_moe.get_2stage_cfgs.cache_clear()
+
+        self.assertEqual(non_ep.block_m, 64)
+        self.assertTrue(non_ep.stage2.keywords["kernelName"].endswith("_atomic_sbuf"))
+        self.assertEqual(non_ep_small.block_m, 32)
+        self.assertTrue(
+            non_ep_small.stage2.keywords["kernelName"].endswith("_atomic_sbuf")
+        )
+        self.assertEqual(ep_control.block_m, 32)
+        self.assertTrue(ep_control.stage2.keywords["kernelName"].endswith("_atomic"))
+
+        params = get_flydsl_kernel_params(non_ep.stage2.keywords["kernelName"])
+        self.assertTrue(params["single_buffer_lds"])
+        with mock.patch.object(
+            fused_moe.aiter.ops.flydsl,
+            "flydsl_moe_stage2",
+            return_value="stage2-result",
+        ) as stage2:
+            result = fused_moe._flydsl_stage2_wrapper(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                16,
+                kernelName=non_ep.stage2.keywords["kernelName"],
+            )
+        self.assertEqual(result, "stage2-result")
+        self.assertTrue(stage2.call_args.kwargs["single_buffer_lds"])
+        self.assertFalse(stage2.call_args.kwargs["use_async_copy"])
+
     def test_committed_gfx942_rows_and_unlisted_control_select_expected_kernels(self):
         with tempfile.TemporaryDirectory() as tempdir:
             config = Path(tempdir) / "tuned_fmoe.csv"
@@ -179,9 +253,13 @@ class TestFmoeSiTUv2Forwarding(unittest.TestCase):
                         "AITER_CONFIGS",
                         SimpleNamespace(AITER_CONFIG_FMOE_FILE=str(config)),
                     ),
-                    mock.patch.object(fused_moe, "get_gfx_runtime", return_value="gfx942"),
+                    mock.patch.object(
+                        fused_moe, "get_gfx_runtime", return_value="gfx942"
+                    ),
                     mock.patch.object(fused_moe, "get_cu_num", return_value=304),
-                    mock.patch.object(fused_moe, "is_flydsl_available", return_value=True),
+                    mock.patch.object(
+                        fused_moe, "is_flydsl_available", return_value=True
+                    ),
                 ):
                     selected = {
                         topk: fused_moe.get_2stage_cfgs(

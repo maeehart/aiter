@@ -221,6 +221,7 @@ def _precompile_to_cache(
     # entries in `get_flydsl_stage2_kernels`). Forwarded into
     # `compile_flydsl_moe_stage2` for stage 2 AOT compilation.
     use_async_copy: bool = False,
+    single_buffer_lds: bool = False,
     cu_num_mul: int = 1,
     **kwargs,
 ):
@@ -753,6 +754,7 @@ def _precompile_to_cache(
                 sort_block_m=sort_block_m,
                 waves_per_eu=waves_per_eu,
                 use_async_copy=use_async_copy,
+                single_buffer_lds=single_buffer_lds,
                 cu_num_mul=cu_num_mul,
                 b_nt=b_nt,
                 xcd_swizzle=xcd_swizzle,
