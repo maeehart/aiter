@@ -1166,6 +1166,26 @@ def _get_padding_for_flydsl(
     return inter_dim_pad, model_dim_pad
 
 
+def _flydsl_act_str(activation) -> str:
+    """Map an ActivationType to the FlyDSL kernel `act` string."""
+    if activation == ActivationType.Swiglu:
+        return "swiglu"
+    if activation == ActivationType.Situv2:
+        return "situv2"
+    return "silu"
+
+
+@functools.lru_cache(maxsize=None)
+def _warn_a16wi4_splitk_downgrade(
+    act_str, token, model_dim, inter_dim, expert, topk, ksplit
+):
+    logger.warning(
+        f"[fused_moe] a16wi4 stage1 split-K does not support {act_str} for this "
+        f"shape; forced k_batch=1 (was k_batch={ksplit}) for "
+        f"{token=} {model_dim=} {inter_dim=} {expert=} {topk=}"
+    )
+
+
 def _flydsl_stage1_wrapper(
     hidden_states,
     w1,
@@ -1197,12 +1217,7 @@ def _flydsl_stage1_wrapper(
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
-    if activation == ActivationType.Swiglu:
-        act = "swiglu"
-    elif activation == ActivationType.Situv2:
-        act = "situv2"
-    else:
-        act = "silu"
+    act = _flydsl_act_str(activation)
     _a_scale_one = parsed.get("a_scale_one", False)
     return aiter.ops.flydsl.flydsl_moe_stage1(
         a=hidden_states,
@@ -2167,6 +2182,17 @@ def get_2stage_cfgs(
         _tile_n = 128
         _tile_k = 128
         _ksplit = get_ksplit(token, topk, expert, inter_dim, model_dim)
+        # Split-K applies activation after combining partials. SiTUv2 uses the
+        # fused post-op only for bf16 output with a 32-aligned inter_dim.
+        _act_str = _flydsl_act_str(activation)
+        _splitk_act_ok = _act_str == "silu" or (
+            _act_str == "situv2" and _out_str == "bf16" and inter_dim % 32 == 0
+        )
+        if _ksplit > 1 and not _splitk_act_ok:
+            _warn_a16wi4_splitk_downgrade(
+                str(activation), token, model_dim, inter_dim, expert, topk, _ksplit
+            )
+            _ksplit = 0
         from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
 
         kn1 = flydsl_kernel_name(1, "bf16", "int4", _out_str, _tile_m, _tile_n, _tile_k)

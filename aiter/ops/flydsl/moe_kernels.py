@@ -1611,6 +1611,47 @@ def flydsl_moe_stage1(
                 torch.cuda.current_stream(),
             ),
         )
+    elif _is_splitk and act == "situv2":
+        # Apply SiTUv2 once over the combined gate/up partials.
+        if inter_dim % 32 != 0:
+            raise NotImplementedError(
+                "split-K stage1 situv2 post-activation requires inter_dim "
+                f"divisible by 32, got {inter_dim}"
+            )
+        if tmp_out.dtype != dtypes.bf16 or out.dtype != dtypes.bf16:
+            raise NotImplementedError(
+                "split-K stage1 situv2 post-activation requires bf16 partials "
+                f"and bf16 output, got {tmp_out.dtype}/{out.dtype}"
+            )
+        # sorted_token_ids includes worst-case padding; launch only rows covered
+        # by the GEMM.
+        _situ_post_rows = min(num_sorted_rows, _grid_y * _sort_block_m)
+        _situ_fused_k = _get_compiled_silu_fused(
+            inter_dim,
+            topk,
+            "none",
+            gui_layout=False,
+            act=act,
+            enable_bias=use_splitk_bias,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+        )
+        _run_compiled(
+            _situ_fused_k,
+            (
+                ptr_arg(tmp_out.view(-1, inter_dim * 2)),
+                ptr_arg(out.view(-1).view(torch.uint8)),
+                ptr_arg(out_scale_sorted_flat),
+                ptr_arg(sorted_token_ids),
+                ptr_arg(num_valid_ids),
+                ptr_arg(topk_ids_arg),
+                ptr_arg(bias_arg),
+                token_num,
+                _situ_post_rows,
+                _swiglu_limit_val,
+                torch.cuda.current_stream(),
+            ),
+        )
     elif _is_splitk:
         from aiter.ops.activation import (
             silu_and_mul,

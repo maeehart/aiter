@@ -22,7 +22,6 @@ from aiter.ops.shuffle import (
     shuffle_weight,
 )
 
-
 _SKIP_GFX942_FLYDSL = pytest.mark.skipif(
     get_gfx() != "gfx942" or not is_flydsl_available(),
     reason="gfx942 FlyDSL required",
@@ -30,9 +29,10 @@ _SKIP_GFX942_FLYDSL = pytest.mark.skipif(
 
 
 @_SKIP_GFX942_FLYDSL
-def test_flydsl_stage1_a16wi4_situv2():
-    """Compare direct-store packed-int4 SiTUv2 stage1 against torch."""
-    token, model_dim, inter_dim, experts, topk, block_m = 16, 512, 256, 8, 2, 16
+@pytest.mark.parametrize("k_batch", [1, 2])
+def test_flydsl_stage1_a16wi4_situv2(k_batch: int):
+    """Compare packed-int4 SiTUv2 stage1 against torch."""
+    token, model_dim, inter_dim, experts, topk, block_m = 16, 1024, 256, 8, 2, 16
     beta, linear_beta = 0.5, 2.0
     torch.manual_seed(0)
     torch.cuda.manual_seed(0)
@@ -101,6 +101,7 @@ def test_flydsl_stage1_a16wi4_situv2():
         situ_linear_beta=linear_beta,
         w1_scale=w1_scale_shuffled,
         a1_scale=None,
+        k_batch=k_batch,
     )
     torch.cuda.synchronize()
     torch.testing.assert_close(actual, reference, atol=0.2, rtol=0.1)

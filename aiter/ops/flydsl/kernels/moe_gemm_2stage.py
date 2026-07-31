@@ -12,7 +12,6 @@ It is extracted from `tests/kernels/test_moe_gemm.py` so that:
 - `tests/` holds correctness/perf harnesses
 """
 
-import logging
 import os
 import functools
 from contextlib import contextmanager
@@ -98,13 +97,7 @@ def _stage1_activation_module_tag(
         return "_silu"
 
     def float_tag(value: float) -> str:
-        return (
-            float(value)
-            .hex()
-            .replace("-", "m")
-            .replace("+", "p")
-            .replace(".", "d")
-        )
+        return float(value).hex().replace("-", "m").replace("+", "p").replace(".", "d")
 
     return f"_situv2_sb{float_tag(situ_beta)}_slb{float_tag(situ_linear_beta)}"
 
@@ -171,9 +164,7 @@ def compile_moe_gemm1(
         if situ_beta <= 0.0:
             raise ValueError(f"situ_beta must be > 0, got {situ_beta!r}")
         if situ_linear_beta <= 0.0:
-            raise ValueError(
-                f"situ_linear_beta must be > 0, got {situ_linear_beta!r}"
-            )
+            raise ValueError(f"situ_linear_beta must be > 0, got {situ_linear_beta!r}")
 
     # NOTE: don't materialize MLIR types outside an active MLIR Context.
     def out_mlir():
@@ -221,11 +212,8 @@ def compile_moe_gemm1(
     # Split-K validation
     _is_splitk = k_batch > 1
     if _is_splitk:
-        if act != "silu":
-            raise NotImplementedError(
-                "split-K stage1 activation supports only 'silu', got "
-                f"{act!r}"
-            )
+        # Split-K stores raw gate/up partials; the caller applies activation
+        # after the atomic accumulation completes.
         _k_per_batch = model_dim // k_batch
         assert (
             model_dim % k_batch == 0
@@ -342,7 +330,12 @@ def compile_moe_gemm1(
     _gs_tag = f"_g{group_size}" if use_groupwise_scale else ""
     scale_tag = "_sbf16" if _scale_is_bf16 else ""
     _split_k_tag = f"_splitk{k_batch}" if _is_splitk else ""
-    _act_tag = _stage1_activation_module_tag(act, situ_beta, situ_linear_beta)
+    # Split-K emits no activation code, so all activations share one binary.
+    _act_tag = (
+        "_silu"
+        if _is_splitk
+        else _stage1_activation_module_tag(act, situ_beta, situ_linear_beta)
+    )
     module_name = (
         f"mfma_moe1_{in_dtype}_{out_dtype}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
