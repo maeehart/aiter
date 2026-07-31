@@ -212,10 +212,8 @@ def compile_moe_gemm1(
     # Split-K validation
     _is_splitk = k_batch > 1
     if _is_splitk:
-        if act != "silu":
-            raise NotImplementedError(
-                "split-K stage1 activation supports only 'silu', got " f"{act!r}"
-            )
+        # Split-K stores raw gate/up partials; the caller applies activation
+        # after the atomic accumulation completes.
         _k_per_batch = model_dim // k_batch
         assert (
             model_dim % k_batch == 0
@@ -332,7 +330,12 @@ def compile_moe_gemm1(
     _gs_tag = f"_g{group_size}" if use_groupwise_scale else ""
     scale_tag = "_sbf16" if _scale_is_bf16 else ""
     _split_k_tag = f"_splitk{k_batch}" if _is_splitk else ""
-    _act_tag = _stage1_activation_module_tag(act, situ_beta, situ_linear_beta)
+    # Split-K emits no activation code, so all activations share one binary.
+    _act_tag = (
+        "_silu"
+        if _is_splitk
+        else _stage1_activation_module_tag(act, situ_beta, situ_linear_beta)
+    )
     module_name = (
         f"mfma_moe1_{in_dtype}_{out_dtype}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
