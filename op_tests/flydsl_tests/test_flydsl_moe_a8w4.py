@@ -243,6 +243,7 @@ def test_flydsl_stage2_a8w4_gui(inter_dim, seed):
 @pytest.mark.parametrize(
     ("inter_dim", "tile_k"),
     [
+        pytest.param(128, 128, id="bk128_i128"),
         pytest.param(384, 128, id="bk128"),
         pytest.param(512, 256, id="bk256"),
     ],
