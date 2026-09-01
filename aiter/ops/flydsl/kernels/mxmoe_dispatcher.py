@@ -133,6 +133,7 @@ def compile_gemm2_a4w4_port(
     has_npad=False,
     out_dtype="bf16",
     enable_bias=False,
+    compact_k32=False,
 ):
     """Compile gemm2 a4w4 down-proj; epilog 'atomic' (weighted atomic-fadd) or 'reduce' (store into out[token_id*topk+slot]). inter_dim runtime; SBM None -> SBM==BM byte-identical."""
     SBM = _norm_sbm(SBM, BM)
@@ -156,6 +157,16 @@ def compile_gemm2_a4w4_port(
     if route_out_fp8 and not use_reduce:
         raise AssertionError("out_dtype='fp8' is supported only with epilog='reduce'")
     g2_kstatic = bool(g2_kstatic)
+    if compact_k32 and not (
+        a_dtype == "fp4"
+        and b_dtype == "fp4"
+        and BK == 128
+        and INTER_MAX == 128
+        and g2_kstatic
+    ):
+        raise AssertionError(
+            "compact_k32 requires A4W4, BK=128, INTER_MAX=128, and g2_kstatic=True"
+        )
     if g2_kstatic and route_out_fp8:
         from .mxfp4_gemm_common import FP8OUT_PITCH_ALIGN, FP8OUT_SCALE_BLK
 
@@ -200,7 +211,7 @@ def compile_gemm2_a4w4_port(
     aStages = 3 if (not g2_bf16_lds or 3 * slot_bytes <= c_lds_bytes) else 2
     a_slot_alias = aStages <= kStages
     lds_bytes = max(c_lds_bytes, aStages * slot_bytes)
-    K_TILES_RT_MAX = INTER_MAX // BK
+    K_TILES_RT_MAX = 1 if compact_k32 else INTER_MAX // BK
     g2_apre = g2_kstatic and aStages >= K_TILES_RT_MAX
     a_preload = min(aStages, K_TILES_RT_MAX) if g2_apre else kStages
     total_k_halves = K_TILES_RT_MAX * (BK // 128)
@@ -208,13 +219,13 @@ def compile_gemm2_a4w4_port(
         k_valid_halves = total_k_halves
     if k_valid_halves < 0 or k_valid_halves > total_k_halves:
         raise AssertionError(
-            f"k_valid_halves must be in [0, {total_k_halves}], " f"got {k_valid_halves}"
+            f"k_valid_halves must be in [0, {total_k_halves}], got {k_valid_halves}"
         )
     # N_OUT = model_dim/hidden is runtime; HIDDEN_MAX is a compile/cache bucket
     # so different runtime hidden sizes can reuse one compiled launcher.
-    assert (
-        HIDDEN_MAX % BN == 0
-    ), f"HIDDEN_MAX must be a multiple of {BN}, got {HIDDEN_MAX}"
+    assert HIDDEN_MAX % BN == 0, (
+        f"HIDDEN_MAX must be a multiple of {BN}, got {HIDDEN_MAX}"
+    )
 
     # Kernel-name tags empty on the default so its name/IR stays byte-identical (each variant distinct).
     atag = "_a8" if is_f8 else ""
@@ -246,12 +257,13 @@ def compile_gemm2_a4w4_port(
     out_tag = "_fp8out" if route_out_fp8 else ""
     tile_tag = "" if (BN, BK) == (256, 256) else f"_bn{BN}_bk{BK}"
     bias_tag = "_bias" if enable_bias else ""
+    compact_tag = "_compactk32" if compact_k32 else ""
     kh_tag = (
         f"_kh{k_valid_halves}" if has_pad and k_valid_halves < total_k_halves else ""
     )
     pad_mode_tag = f"_kp{int(has_kpad)}_np{int(has_npad)}" if has_pad else ""
     g2_epi_lanes = _pick_epi_lanes(BM, BN, route_out_fp8, g2_scale_blk)
-    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{persist_tag}{pad_tag}{pad_mode_tag}{kh_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{dw_tag}{kst_tag}{pitch_tag}{sblk_tag}{out_tag}{bias_tag}_v2_biasabi6"
+    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{persist_tag}{pad_tag}{pad_mode_tag}{kh_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{dw_tag}{kst_tag}{pitch_tag}{sblk_tag}{out_tag}{bias_tag}{compact_tag}_v2_biasabi6"
     name = f"gemm2_a4w4_port_{tag}"
 
     @fx.struct
@@ -289,21 +301,22 @@ def compile_gemm2_a4w4_port(
         lds_base_i32 = fx.Int32(fx.ptrtoint(lds.buf.ptr))
 
         def issue_all_a_loads(m_row0):
-            for slot in range_constexpr(a_preload):
-                issue_a_load_lds_dt(
-                    arg_aq,
-                    aq_num,
-                    lds_base_i32,
-                    slot,
-                    slot,
-                    m_row0,
-                    wave,
-                    lane,
-                    is_f8,
-                    KH_TILE_A,
-                    k_bytes,
-                    BM=BM,
-                )
+            if const_expr(not compact_k32):
+                for slot in range_constexpr(a_preload):
+                    issue_a_load_lds_dt(
+                        arg_aq,
+                        aq_num,
+                        lds_base_i32,
+                        slot,
+                        slot,
+                        m_row0,
+                        wave,
+                        lane,
+                        is_f8,
+                        KH_TILE_A,
+                        k_bytes,
+                        BM=BM,
+                    )
 
         # One (m_block, n_block) unit for a synthesized unit_bx; non-persist calls once, persist per m-tile.
         def run_unit(unit_bx, mn_idx=None):
@@ -355,6 +368,7 @@ def compile_gemm2_a4w4_port(
                 has_kpad=has_kpad,
                 has_npad=has_npad,
                 mn_idx=mn_idx,
+                compact_k32=compact_k32,
             )
 
         if const_expr(not persist and g2_spart <= 0):
@@ -537,6 +551,7 @@ def get_g2(
     has_kpad=False,
     has_npad=False,
     enable_bias=False,
+    compact_k32=False,
 ):
     # Cache key uses compile-time buckets; runtime inter_dim/model_dim share a
     # launcher while remaining within their respective caps.
@@ -580,6 +595,7 @@ def get_g2(
         has_npad,
         out_dtype,
         enable_bias,
+        compact_k32,
     )
     launch = G2_CACHE.get(key)
     if launch is None:
@@ -608,6 +624,7 @@ def get_g2(
             has_npad=has_npad,
             out_dtype=out_dtype,
             enable_bias=enable_bias,
+            compact_k32=compact_k32,
         )
         G2_CACHE[key] = launch
     return launch
@@ -650,11 +667,16 @@ def mxfp4_moe_gemm2(
     g2_spart=None,
     stream=None,
     bias=None,
+    compact_k32=False,
 ):
     """Stage-2 down-proj gemm; epilog 'atomic' (weighted atomic.fadd) or 'reduce' (store into out[token_id*topk+slot]). inter_dim_pad/model_dim_pad>0 enable has_pad pad-skip (both 0 -> byte-identical); persist = fixed cu_num m-slot grid (default OFF)."""
     import torch
 
     _validate_v2_gemm2_dtypes(a_dtype, b_dtype)
+    compact_k32 = bool(
+        compact_k32
+        or (a_dtype == "fp4" and b_dtype == "fp4" and D_INTER == 32 and BK == 128)
+    )
     if persist and cu_num <= 0:
         cu_num = get_cu_num()
     SBM = _norm_sbm(SBM, BM)
@@ -668,7 +690,11 @@ def mxfp4_moe_gemm2(
         raise AssertionError(
             f"D_HIDDEN (N_OUT) must be a multiple of BN ({BN}), got {D_HIDDEN}"
         )
-    if D_INTER % BK != 0:
+    if compact_k32 and not (
+        a_dtype == "fp4" and b_dtype == "fp4" and D_INTER == 32 and BK == 128
+    ):
+        raise AssertionError("compact_k32 requires A4W4 with D_INTER=32 and BK=128")
+    if not compact_k32 and D_INTER % BK != 0:
         raise AssertionError(
             f"D_INTER (K) must be a multiple of BK ({BK}), got {D_INTER}"
         )
@@ -701,9 +727,9 @@ def mxfp4_moe_gemm2(
             "FlyDSL v2 GEMM2 requires sorted_weights; "
             "doweight_stage1=True is not supported"
         )
-    _kstatic = os.environ.get("MXFP4_G2_KSTATIC", "1") == "1"
+    _kstatic = compact_k32 or os.environ.get("MXFP4_G2_KSTATIC", "1") == "1"
     if _kstatic:
-        INTER_MAX = D_INTER
+        INTER_MAX = 128 if compact_k32 else D_INTER
     real_k = D_INTER - inter_dim_pad
     # Keep the half containing a partial real-K tail, matching v1. This
     # skips complete trailing halves while allowing the final partial half
@@ -737,6 +763,7 @@ def mxfp4_moe_gemm2(
         has_kpad=inter_dim_pad > 0,
         has_npad=model_dim_pad > 0,
         enable_bias=bias is not None,
+        compact_k32=compact_k32,
     )
     max_m_blocks = (max_sorted + BM - 1) // BM
     if persist:

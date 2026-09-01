@@ -267,6 +267,7 @@ def gemm2_body_v2(
     k_valid_halves=None,
     has_kpad=False,
     has_npad=False,
+    compact_k32=False,
 ):
     # GEMM2 double-buffers B weight and scale one tile ahead. bhoist issues that
     # prefetch above the LDS barrier; ascale_pf prefetches A-scale one tile ahead.
@@ -283,6 +284,9 @@ def gemm2_body_v2(
     kScaleSubBlocks = max(1, kMChunks // 2)
     is_f8_a = a_dtype == "fp8"  # only the A path differs
     is_f8_b = b_dtype == "fp8"
+    if compact_k32:
+        assert a_dtype == "fp4" and b_dtype == "fp4"
+        assert BK == 128 and INTER_MAX == 128
     B_NDW = 8 if is_f8_b else 4
     B_PAIR = 2 if is_f8_b else 1
     a_pack = 1 if is_f8_a else 2
@@ -292,7 +296,7 @@ def gemm2_body_v2(
     K_rt = fx.Int32(i32_inter)
     K_BYTES = _udiv(K_rt, fx.Int32(a_pack))
     kc_rt = _udiv(K_rt + fx.Int32(255), fx.Int32(256))
-    K_TILES_RT = _udiv(K_rt, fx.Int32(BK))
+    K_TILES_RT = fx.Int32(1) if const_expr(compact_k32) else _udiv(K_rt, fx.Int32(BK))
     kAS_per_chunk_dw = kc_rt * fx.Int32(64)
     kBS_stride_n0_dw = kc_rt * fx.Int32(64)
     # N_OUT = model_dim/hidden is the gemm2 output N dim; runtime via i32_hidden (no K-loop dependency).
@@ -300,7 +304,7 @@ def gemm2_body_v2(
     kbs_per_expert_dw = _udiv(N_OUT_rt, fx.Int32(32)) * kBS_stride_n0_dw
     num_n_blocks = _udiv(N_OUT_rt, fx.Int32(BN))
     KH4 = _udiv(K_rt, fx.Int32(4 if is_f8_b else 8))
-    K_TILES_MAX = INTER_MAX // BK
+    K_TILES_MAX = 1 if compact_k32 else INTER_MAX // BK
     K_SCALE_CHUNKS_MAX = (INTER_MAX + 255) // 256
     total_k_halves = K_TILES_MAX * kHalves
     if k_valid_halves is None:
@@ -343,24 +347,53 @@ def gemm2_body_v2(
         for _ in range_constexpr(kMChunks)
     ]
 
-    def issue_a_load_lds(slot, kt):
-        issue_a_load_lds_dt(
+    compact_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(0), 32)
+    compact_a_view = (
+        flat_buffer_view(
             arg_aq,
-            aq_num_records,
-            s_aq_base,
-            slot,
-            kt,
-            m_row,
-            wave,
-            lane,
-            is_f8_a,
-            KH_TILE_A,
-            K_BYTES,
-            BM=BM,
+            None,
+            T.i32,
+            align=16,
+            elem_bytes=4,
+            fold=False,
+            num_records_bytes=aq_num_records,
         )
+        if compact_k32
+        else None
+    )
+
+    def issue_a_load_lds(slot, kt):
+        if const_expr(not compact_k32):
+            issue_a_load_lds_dt(
+                arg_aq,
+                aq_num_records,
+                s_aq_base,
+                slot,
+                kt,
+                m_row,
+                wave,
+                lane,
+                is_f8_a,
+                KH_TILE_A,
+                K_BYTES,
+                BM=BM,
+            )
 
     def issue_a_ds_read(slot):
         # A ds-read for one slot into a_frags: fp8 -> i32<8:1> (two 128-K halves), fp4 -> i32<4:1>.
+        if const_expr(compact_k32):
+            zero_i32x4 = Vec.filled(4, 0, Int32)
+            for i in range_constexpr(kMChunks):
+                a_frags[i][0].store(zero_i32x4)
+                if lane_div_16 == fx.Int32(0):
+                    compact_row = m_row + fx.Int32(i * 16) + lane_mod_16
+                    compact_i32 = compact_row * fx.Int32(4)
+                    fx.copy(
+                        compact_copy_atom,
+                        compact_a_view[compact_i32, None],
+                        a_frags[i][0],
+                    )
+            return
         for k in range_constexpr(kHalves):
             for i in range_constexpr(kMChunks):
                 lds_row = lane_mod_16 + i * 16
@@ -472,7 +505,21 @@ def gemm2_body_v2(
             num_records_bytes=nrec,
         )
 
-    bq_views = [make_bq_view(j) for j in range_constexpr(numAccN)]
+    compact_b_view = (
+        flat_buffer_view(
+            arg_bq,
+            None,
+            T.i32,
+            align=16,
+            elem_bytes=4,
+            fold=False,
+        )
+        if compact_k32
+        else None
+    )
+    bq_views = (
+        [] if compact_k32 else [make_bq_view(j) for j in range_constexpr(numAccN)]
+    )
 
     mni_base = n_block_idx * (BN // 16 // 2) + wave * (BN // 64 // 2)
     bscale_views = [
@@ -485,15 +532,32 @@ def gemm2_body_v2(
         for mw in range_constexpr(nPairs)
     ]
 
-    frag_tmpl = (
-        None
-        if const_expr(is_f8_b)
-        else bq_views[0][0, 0, 0, 0, None]  # i32<4:1> (16B = 32 fp4)
-    )
+    if compact_k32:
+        frag_tmpl = fx.make_rmem_tensor(4, Int32)
+    elif is_f8_b:
+        frag_tmpl = None
+    else:
+        frag_tmpl = bq_views[0][0, 0, 0, 0, None]  # i32<4:1> (16B = 32 fp4)
     # B-scale word template shares the A-scale layout (sc_frag_tmpl).
 
     def issue_b_value_load(dst, j, half, kt_rt):
-        if const_expr(is_f8_b):
+        if const_expr(compact_k32):
+            dst.store(Vec.filled(4, 0, Int32))
+            if lane_div_16 == fx.Int32(0):
+                compact_col = (
+                    n_block_idx * fx.Int32(BN)
+                    + wave * fx.Int32(BN // 4)
+                    + fx.Int32(j * 16)
+                    + lane_mod_16
+                )
+                compact_row = e * N_OUT_rt + compact_col
+                compact_i32 = compact_row * fx.Int32(4)
+                fx.copy(
+                    compact_copy_atom,
+                    compact_b_view[compact_i32, None],
+                    dst,
+                )
+        elif const_expr(is_f8_b):
             lo = fx.make_rmem_tensor(4, Int32)
             hi = fx.make_rmem_tensor(4, Int32)
             fx.copy(
@@ -533,6 +597,11 @@ def gemm2_body_v2(
             issue_bscale_into(bsf, scale_chunk_tile(kt_rt))
 
     def make_bq_fragments():
+        if const_expr(compact_k32):
+            return [
+                [fx.make_rmem_tensor(4, Int32) for _ in range_constexpr(kHalves)]
+                for _ in range_constexpr(numAccN)
+            ]
         if const_expr(is_f8_b):
             return [
                 [fx.make_rmem_tensor(B_NDW, Int32) for _ in range_constexpr(kHalves)]

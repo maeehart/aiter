@@ -231,12 +231,12 @@ def compile_mixed_moe_gemm1_common(
         raise ValueError("mock_gate_only requires k_batch > 1 (split-K)")
     if is_splitk:
         k_per_batch = model_dim // k_batch
-        assert (
-            model_dim % k_batch == 0
-        ), f"model_dim={model_dim} not divisible by k_batch={k_batch}"
-        assert (
-            k_per_batch % tile_k == 0
-        ), f"K_per_batch={k_per_batch} not divisible by tile_k={tile_k}"
+        assert model_dim % k_batch == 0, (
+            f"model_dim={model_dim} not divisible by k_batch={k_batch}"
+        )
+        assert k_per_batch % tile_k == 0, (
+            f"K_per_batch={k_per_batch} not divisible by tile_k={tile_k}"
+        )
 
         out_dtype = "bf16"
     else:
@@ -285,9 +285,9 @@ def compile_mixed_moe_gemm1_common(
     # therefore must not be part of the on-disk symbol/cache identity.
     act_tag = "" if act == "silu" else f"_{act}"
     heterogeneous_tag = f"_shared_fp8_e{shared_expert_id}" if heterogeneous_b else ""
-    # ABI v33 adds four runtime SiTUv2 beta scalars; heterogeneous ABI tracks one
-    # version ahead of the ordinary kernel.
-    kernel_version = 34 if heterogeneous_b else 33
+    # Bump the cache identity for native inter-dim-32 launch sizing.
+    # Heterogeneous ABI remains one version ahead of the ordinary kernel.
+    kernel_version = 35 if heterogeneous_b else 34
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
         f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}_v{kernel_version}"
@@ -3230,7 +3230,7 @@ def compile_mixed_moe_gemm1_common(
 
         inter_dim_pad_total = arith.constant(2 * inter_dim_pad, index=True)
         tile2_pad = 0
-        if const_expr(not gate_only):
+        if const_expr(not gate_only and not (inter_dim == 32 and inter_dim_pad == 0)):
             tile_k_stage2 = tile_k // 2
             tile2_pad = (
                 tile_k_stage2 - (inter_dim - inter_dim_pad) % tile_k_stage2

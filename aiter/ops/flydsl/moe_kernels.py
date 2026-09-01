@@ -1638,11 +1638,15 @@ def _flydsl_moe_stage1_impl(
     )
     padded_rows = (sorted_size + 255) // 256 * 256
     padded_cols = (scale_cols + 7) // 8 * 8
-    out_scale_sorted_flat = (
-        torch.empty(padded_rows * padded_cols, dtype=torch.uint8, device=dev)
-        if _need_sort
-        else torch.empty(0, dtype=torch.uint8, device=dev)
-    )
+    if _need_sort:
+        scale_factory = torch.zeros if padded_cols != scale_cols else torch.empty
+        out_scale_sorted_flat = scale_factory(
+            padded_rows * padded_cols,
+            dtype=torch.uint8,
+            device=dev,
+        )
+    else:
+        out_scale_sorted_flat = torch.empty(0, dtype=torch.uint8, device=dev)
 
     # split-K GEMM kernel does not fuse quant; the fused silu_and_mul_fq kernel
     # handles activation + quant + scale-sort after the GEMM completes.
@@ -2632,15 +2636,15 @@ def flydsl_moe_fused_route_quant_scatter(
     numel = token_num * topk
     model_dim = hidden_states.shape[-1]
     rows_per_tile = wmma_rep * 16
-    assert (
-        max_m % rows_per_tile == 0
-    ), f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+    assert max_m % rows_per_tile == 0, (
+        f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+    )
 
     out_E = E if out_E is None else int(out_E)
     out_max_m = max_m if out_max_m is None else int(out_max_m)
-    assert (
-        out_max_m % rows_per_tile == 0
-    ), f"out_max_m ({out_max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+    assert out_max_m % rows_per_tile == 0, (
+        f"out_max_m ({out_max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+    )
 
     payload_bytes_per_row = model_dim if quant_mode == "fp8" else model_dim // 2
     scale_bytes_per_row = model_dim // 32
@@ -2693,9 +2697,9 @@ def flydsl_moe_fused_route_quant_scatter(
     )
 
     if use_routeks_stage1:
-        assert (
-            not use_g2l
-        ), "EP g2l fusion is not implemented on the routeks stage1 path"
+        assert not use_g2l, (
+            "EP g2l fusion is not implemented on the routeks stage1 path"
+        )
         topids_to_rows_kernel = _get_compiled_topids_to_rows()
         topids_to_rows_kernel(
             ptr_arg(topk_ids_i32),
@@ -3000,15 +3004,15 @@ def flydsl_moe_fused_quant_preshuffle(
             f"flydsl_moe_fused_quant_preshuffle: quant_mode={quant_mode!r} "
             "unsupported (expected 'fp4' or 'fp8')."
         )
-    assert (
-        grouped_in.dtype == torch.bfloat16
-    ), f"fused grouped quant+preshuffle requires bf16 input (got {grouped_in.dtype})"
+    assert grouped_in.dtype == torch.bfloat16, (
+        f"fused grouped quant+preshuffle requires bf16 input (got {grouped_in.dtype})"
+    )
     device = grouped_in.device
     feat_dim = grouped_in.shape[-1]
     rows_per_tile = wmma_rep * 16
-    assert (
-        max_m % rows_per_tile == 0
-    ), f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+    assert max_m % rows_per_tile == 0, (
+        f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+    )
 
     n_rows = E * max_m
     Pb = feat_dim if quant_mode == "fp8" else feat_dim // 2

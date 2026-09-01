@@ -19,6 +19,23 @@ from aiter.ops.attention import get_mla_decode_fwd_max_splits
 _FLYDSL_MLA_REDUCE_TARGET_GFX = ("gfx942", "gfx950")
 _FLYDSL_MLA_REDUCE_TARGET_H = 16
 _FLYDSL_MLA_REDUCE_TARGET_DV = 512
+_MLA_STAGE1_ACCEPTS_CAUSAL: bool | None = None
+
+
+def _call_mla_decode_stage1_asm_fwd(*args, causal: bool) -> None:
+    """Call old and new stage-1 ABIs without changing their numerics."""
+    global _MLA_STAGE1_ACCEPTS_CAUSAL
+    if _MLA_STAGE1_ACCEPTS_CAUSAL is not False:
+        try:
+            aiter.mla_decode_stage1_asm_fwd(*args, causal)
+            _MLA_STAGE1_ACCEPTS_CAUSAL = True
+            return
+        except RuntimeError as error:
+            message = str(error)
+            if "expected at most 25 argument(s) but received 26" not in message:
+                raise
+            _MLA_STAGE1_ACCEPTS_CAUSAL = False
+    aiter.mla_decode_stage1_asm_fwd(*args)
 
 
 @functools.lru_cache(maxsize=1)
@@ -679,7 +696,7 @@ def mla_decode_fwd(
         )
         use_valid_split_count_reduce = int(num_kv_splits > 1)
 
-        aiter.mla_decode_stage1_asm_fwd(
+        _call_mla_decode_stage1_asm_fwd(
             q,
             kv_buffer,
             qo_indptr,
@@ -705,7 +722,7 @@ def mla_decode_fwd(
             cp_rank,
             valid_split_count,
             use_valid_split_count_reduce,
-            causal,
+            causal=causal,
         )
 
         if num_kv_splits == 1 and (
@@ -953,7 +970,7 @@ def mla_decode_fwd(
                 o,
             )
         else:
-            aiter.mla_decode_stage1_asm_fwd(
+            _call_mla_decode_stage1_asm_fwd(
                 q,
                 kv_buffer,
                 qo_indptr,
@@ -979,7 +996,7 @@ def mla_decode_fwd(
                 cp_rank,
                 None,
                 0,
-                causal,
+                causal=causal,
             )
 
         _mla_decode_reduce_v1_dispatch(

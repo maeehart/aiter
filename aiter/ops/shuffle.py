@@ -182,8 +182,8 @@ def shuffle_weight(
     BK = IK * 2
     K = 16 // x.element_size() if not use_int4 else 32
     BN = IN
-    assert x.shape[-2] % BN == 0, f"{x.shape[-2]} % {BN} == {x.shape[-2] % BN }"
-    assert x.shape[-1] % BK == 0, f"{x.shape[-1]} % {BK} == {x.shape[-1] % BK }"
+    assert x.shape[-2] % BN == 0, f"{x.shape[-2]} % {BN} == {x.shape[-2] % BN}"
+    assert x.shape[-1] % BK == 0, f"{x.shape[-1]} % {BK} == {x.shape[-1] % BK}"
 
     x_ = x
     x_ = x_.view(-1, x.shape[-2] // BN, BN, x.shape[-1] // BK, BK // K, K)
@@ -211,12 +211,12 @@ def shuffle_weight_NK(
     kPerLane = inst_K // (64 // inst_N)
     if use_int4:
         kPerLane *= 2
-    assert (
-        x.shape[-2] % inst_N == 0
-    ), f"{x.shape[-2]} % {inst_N} == {x.shape[-2] % inst_N }"
-    assert (
-        x.shape[-1] % inst_K == 0
-    ), f"{x.shape[-1]} % {inst_K} == {x.shape[-1] % inst_K }"
+    assert x.shape[-2] % inst_N == 0, (
+        f"{x.shape[-2]} % {inst_N} == {x.shape[-2] % inst_N}"
+    )
+    assert x.shape[-1] % inst_K == 0, (
+        f"{x.shape[-1]} % {inst_K} == {x.shape[-1] % inst_K}"
+    )
 
     x_ = x
     x_ = x_.view(
@@ -347,7 +347,10 @@ def shuffle_scale(
             dtype=src.dtype,
             device=src.device,
         )
-
+        if scale_padded.element_size() == 1:
+            scale_padded.view(torch.uint8).zero_()
+        else:
+            scale_padded.zero_()
         scale_padded[:m, :n] = src
         scale = scale_padded
         sm, sn = scale.shape
